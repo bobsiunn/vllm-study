@@ -4,10 +4,20 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.config import CacheConfig
+import vllm.envs as envs
+from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
+
+logger = init_logger(__name__)
+
+# Token threshold for multi-stream indexer overlap.
+# Disables multi-stream for batches > 1024 to avoid SM contention.
+_INDEXER_STREAM_TOKEN_THRESHOLD = 1024
 
 
 @dataclass
@@ -27,6 +37,221 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    alt_stream: torch.cuda.Stream | None = None
+
+
+class _WkForkModule(torch.nn.Module):
+    """Compiled module for wk+k_norm+weights_proj on alt_stream.
+
+    Wraps the indexer's wk, k_norm, and weights_proj into a single
+    compilation unit.  When compiled with torch.compile the three
+    operations benefit from Inductor optimizations:
+      - wk:  FP8 quant+GEMM fusion  (saves ~2-3 us vs eager)
+      - k_norm:  operator fusion with surrounding ops
+      - weights_proj:  optimised BF16 kernel selection
+
+    The compiled module is called inside the mla_wk_fork custom op,
+    which runs it on alt_stream concurrent with QKV-A on the main
+    stream.
+
+    Returns a concatenated ``[k, raw_weights]`` tensor; the join
+    caller splits it back using known ``wk_dim`` and ``weights_dim``.
+
+    Sub-modules are stored via ``object.__setattr__`` so they do NOT
+    appear in ``_modules`` / ``state_dict()``.  This prevents:
+      1. Duplicate parameter entries (they are shared with Indexer).
+      2. State-dict key mismatches during weight loading.
+      3. ``isinstance`` false-positives when tests use MagicMock.
+    """
+
+    def __init__(self, wk, k_norm, weights_proj):
+        super().__init__()
+        object.__setattr__(self, "wk", wk)
+        object.__setattr__(self, "k_norm", k_norm)
+        object.__setattr__(self, "weights_proj", weights_proj)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        k, _ = self.wk(hidden_states)
+        k = self.k_norm(k)
+        raw_weights, _ = self.weights_proj(hidden_states)
+        return torch.cat([k, raw_weights], dim=-1)
+
+
+# ---- Multi-Stream wk+weights_proj Overlap Custom Ops (issue_19 fix) ----
+#
+# Two minimal custom ops overlap wk+k_norm+weights_proj with QKV-A:
+#   mla_wk_fork: launches a COMPILED wk+k_norm+weights_proj module on
+#                alt_stream (concurrent with QKV-A on main)
+#   mla_wk_join: waits for alt_stream, returns pre-computed
+#                [k | raw_weights] concatenated tensor
+#
+# CRITICAL DESIGN PRINCIPLES (issues 1-19):
+#   1. ALL indexer GEMMs (wq_b) and q_b_proj MUST stay inside the
+#      main torch.compile graph.  (issues 14-16 lesson)
+#   2. Fork operations MUST ALSO be compiled — running them eagerly
+#      loses FP8 quant+GEMM fusion, operator fusion, and kernel
+#      selection (~2-4 us/block overhead).  (issue_19 lesson)
+#   3. The fix: a SEPARATELY torch.compile'd _WkForkModule wraps
+#      wk+k_norm+weights_proj.  The compiled module is called inside
+#      the fork custom op on alt_stream.
+#
+# WHY wk+k_norm AND weights_proj:
+#   Both depend ONLY on hidden_states (the layer input).  They can
+#   start at the VERY BEGINNING of the forward pass, concurrent with
+#   the QKV-A GEMM on the main stream.
+#
+#   Alt stream (compiled):  wk FP8Q+GEMM (~10 us) + k_norm (~1.5 us)
+#                           + weights_proj BF16 GEMM (~5 us) ≈ 17 us
+#   Main stream (compiled): QKV-A (~15 us) + Q-A LN (~2 us)
+#                           + Q-B proj (~6.5 us) + kv preprocess (~3 us)
+#                           + RoPE (~1.5 us) ≈ 28 us
+#   Alt (17 us) < Main (28 us) → fork is completely hidden!
+#
+#   issue_17 savings: ~12 us/block (wk hidden behind QKV-A)
+#   issue_18 additional: weights_proj moved to fork (but uncompiled →
+#                        regression to 60.5 tok/s due to eager overhead)
+#   issue_19 fix:  compile the fork module → recover the regression and
+#                  gain the full ~7 us/block weights_proj savings
+#
+# The indexer call stays INLINE in forward() (traced by torch.compile).
+# Indexer.forward() receives pre-computed k via precomputed_k and raw
+# weights via precomputed_weights, skipping its own wk+k_norm and
+# weights_proj.  The remaining indexer GEMM (wq_b) and
+# sparse_attn_indexer stay in the compiled graph.
+#
+# Pattern EXTENDS MoE shared expert streaming (default_moe_runner.py):
+#   1. Register the layer in static_forward_context during __init__
+#   2. Custom ops retrieve the layer by name from forward_context
+#   3. Stream fork/join happens inside the custom ops (opaque)
+#   4. Fake implementations provide output shape for symbolic execution
+#   5. NOT in _attention_ops — opaque nodes inside compiled region
+#   6. tags=(torch.Tag.needs_fixed_stride_order,) prevents Inductor
+#      stride conversion overhead
+#
+# DIFFERENCE from MoE: the MoE shared expert runs EAGERLY inside its
+# custom op.  Here we add a SEPARATE torch.compile unit (_WkForkModule)
+# for the fork operations.  This is a novel extension; a graceful
+# fallback to eager is included in case torch.compile fails.
+#
+# Fork/Join symmetry:
+#   The fork sets wrapper._wk_forked = True when multi-stream is used.
+#   The join checks this flag to decide whether to wait_stream.  This
+#   ensures fork and join ALWAYS agree on whether multi-stream is active.
+
+
+def _mla_wk_fork(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Launch compiled wk+k_norm+weights_proj on alt_stream.
+
+    Returns hidden_states unchanged (passthrough for data dependency).
+    Stores the concatenated [k, raw_weights] result in
+    ``wrapper._fork_result`` for the join op.
+
+    The fork calls ``wrapper._compiled_fork_ops`` — a separately
+    torch.compile'd _WkForkModule — so that the operations benefit
+    from Inductor optimisations (FP8 fusion, kernel selection) even
+    when running on the alt_stream.
+    """
+    wrapper = get_forward_context().no_compile_layers[layer_name]
+    indexer = wrapper.indexer
+
+    if indexer is None or not wrapper.is_sparse:
+        wrapper._wk_forked = False
+        return hidden_states
+
+    use_multi_stream = (
+        wrapper.alt_stream is not None
+        and not envs.VLLM_DISABLE_INDEXER_STREAM
+        and hidden_states.shape[0] <= _INDEXER_STREAM_TOKEN_THRESHOLD
+    )
+
+    fork_ops = wrapper._compiled_fork_ops
+
+    if use_multi_stream:
+        main_stream = current_stream()
+        alt_stream = wrapper.alt_stream
+
+        # Prevent GC from freeing hidden_states while alt_stream reads it.
+        hidden_states.record_stream(alt_stream)
+
+        # alt_stream waits for hidden_states to be ready on main.
+        alt_stream.wait_stream(main_stream)
+
+        # Launch compiled wk+k_norm+weights_proj on alt_stream
+        # (concurrent with QKV-A on main).
+        with torch.cuda.stream(alt_stream):
+            wrapper._fork_result = fork_ops(hidden_states)
+
+        wrapper._wk_forked = True
+    else:
+        # Sequential: run compiled fork ops on main stream.
+        wrapper._fork_result = fork_ops(hidden_states)
+        wrapper._wk_forked = False
+
+    return hidden_states
+
+
+def _mla_wk_fork_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="mla_wk_fork",
+    op_func=_mla_wk_fork,
+    mutates_args=[],
+    fake_impl=_mla_wk_fork_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _mla_wk_join(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+    join_dim: int,
+) -> torch.Tensor:
+    """Get pre-computed [k, raw_weights], waiting for alt_stream if needed.
+
+    Returns the concatenated tensor stored by ``_mla_wk_fork``.
+    Shape: ``[num_tokens, join_dim]`` where ``join_dim = wk_dim + weights_dim``.
+    Only waits if the fork op set ``wrapper._wk_forked = True``,
+    ensuring symmetric fork/join behaviour.
+    """
+    wrapper = get_forward_context().no_compile_layers[layer_name]
+
+    # Check the flag set by fork — guarantees fork/join symmetry.
+    if getattr(wrapper, '_wk_forked', False):
+        main_stream = current_stream()
+        main_stream.wait_stream(wrapper.alt_stream)
+        wrapper._wk_forked = False
+
+    # Return the concatenated [k, raw_weights] produced by the fork.
+    # The caller splits using known wk_dim and weights_dim.
+    return wrapper._fork_result
+
+
+def _mla_wk_join_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+    join_dim: int,
+) -> torch.Tensor:
+    return torch.empty(
+        hidden_states.shape[0], join_dim,
+        dtype=hidden_states.dtype, device=hidden_states.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="mla_wk_join",
+    op_func=_mla_wk_join,
+    mutates_args=[],
+    fake_impl=_mla_wk_join_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -86,11 +311,49 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.alt_stream = mla_modules.alt_stream
+        # Flag for symmetric fork/join. Set by _mla_wk_fork, checked by
+        # _mla_wk_join. Ensures join only waits when fork actually
+        # launched work on alt_stream.
+        self._wk_forked = False
 
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
             self.topk_indices_buffer = mla_modules.topk_indices_buffer
+            # Store dimensions for the fork/join custom ops.
+            # wk_dim: output dimension of indexer.wk (head_dim=128)
+            # weights_dim: output dimension of indexer.weights_proj (n_head=64)
+            # join_dim: total concatenated dim returned by mla_wk_join
+            self.wk_dim = self.indexer.head_dim
+            self.weights_dim = self.indexer.n_head
+            self.join_dim = self.wk_dim + self.weights_dim
+
+            # Compile wk+k_norm+weights_proj as a SEPARATE torch.compile
+            # unit.  The compiled module runs on alt_stream inside the
+            # mla_wk_fork custom op, concurrent with QKV-A on main.
+            # Uses object.__setattr__ to avoid registering as a sub-module
+            # (prevents state_dict / weight-loading duplication).
+            #
+            # NOTE: This EXTENDS the MoE shared-expert streaming pattern
+            # (default_moe_runner.py) — the MoE pattern runs shared experts
+            # EAGERLY, while we add a separate torch.compile unit for the
+            # fork ops.  Graceful fallback to eager if compilation fails.
+            _fork_mod = _WkForkModule(
+                self.indexer.wk,
+                self.indexer.k_norm,
+                self.indexer.weights_proj,
+            )
+            try:
+                _compiled = torch.compile(_fork_mod, dynamic=True)
+            except Exception:
+                logger.warning(
+                    "Failed to compile MLA fork ops for layer %s, "
+                    "falling back to eager execution.", prefix)
+                _compiled = _fork_mod
+            object.__setattr__(
+                self, '_compiled_fork_ops', _compiled,
+            )
 
         self.mla_attn = MLAAttention(
             num_heads=self.num_heads,
@@ -109,6 +372,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         self.prefix = prefix
+
+        # Register in static_forward_context so the fork/join custom ops
+        # (mla_wk_fork, mla_wk_join) can retrieve this wrapper.
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
 
     def forward(
         self,
@@ -130,12 +400,25 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
+            # Fork: launch wk+k_norm+weights_proj on alt_stream,
+            # concurrent with QKV-A. Opaque to torch.compile.
+            # wk+weights_proj hidden behind QKV-A+Q-A LN+Q-B
+            # (~28 us main > ~20 us alt). All other GEMMs stay
+            # INSIDE torch.compile scope.
+            hidden_states = torch.ops.vllm.mla_wk_fork(
+                hidden_states,
+                self.prefix,
+            )
+
+            # QKV-A GEMM on main stream — COMPILED, concurrent with wk.
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
+
+            # q_b_proj on main stream — INSIDE torch.compile scope.
             q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
@@ -147,7 +430,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c, k_pe = kv_lora.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
@@ -159,9 +444,22 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
 
-        if self.indexer and self.is_sparse:
-            _topk_indices = self.indexer(
-                hidden_states, q_c, positions, self.indexer_rope_emb
+        # Join wk+weights_proj + run indexer INLINE (COMPILED on main).
+        # The indexer GEMM (wq_b) stays in torch.compile scope.
+        # wk+k_norm+weights_proj run on alt_stream (hidden behind QKV-A).
+        # sparse_attn_indexer remains a PIECEWISE split point (as original).
+        if self.indexer is not None and self.is_sparse:
+            k_weights = torch.ops.vllm.mla_wk_join(
+                hidden_states, self.prefix, self.join_dim,
+            )
+            # Split the concatenated join result into k and raw_weights.
+            k_pre, weights_pre = k_weights.split(
+                [self.wk_dim, self.weights_dim], dim=-1,
+            )
+            self.indexer(
+                hidden_states, q_c, positions, self.indexer_rope_emb,
+                precomputed_k=k_pre,
+                precomputed_weights=weights_pre,
             )
 
         if llama_4_scaling is not None:
@@ -171,7 +469,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q,
             kv_c_normed,
             k_pe,
-            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            output_shape=(
+                hidden_states.shape[0],
+                self.num_heads * self.v_head_dim,
+            ),
         )
 
         return self.o_proj(attn_out)[0]

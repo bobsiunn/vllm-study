@@ -686,7 +686,9 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions,
+        rotary_emb, precomputed_k: torch.Tensor | None = None,
+        precomputed_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
@@ -694,8 +696,13 @@ class Indexer(nn.Module):
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
 
-        k, _ = self.wk(hidden_states)
-        k = self.k_norm(k)
+        # Use pre-computed k from mla_wk_fork/join when available.
+        # wk+k_norm were already computed on alt_stream (issue_17 fix).
+        if precomputed_k is not None:
+            k = precomputed_k
+        else:
+            k, _ = self.wk(hidden_states)
+            k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
@@ -723,13 +730,75 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights, _ = self.weights_proj(hidden_states)
+        # Use pre-computed raw weights from mla_wk_fork/join when available.
+        # weights_proj was already computed on alt_stream (issue_18 fix).
+        if precomputed_weights is not None:
+            weights = precomputed_weights
+        else:
+            weights, _ = self.weights_proj(hidden_states)
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
         weights = weights.squeeze(-1)
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
+
+    def _complete_indexer_pipeline(
+        self,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: torch.nn.Module,
+    ) -> None:
+        """Complete the indexer pipeline after parallel projections.
+
+        NOTE: This method is currently UNUSED (dead code). It was added in
+        issue_15 for the expanded multi-stream approach where a single custom
+        op split the indexer into parallel Phase 1 + sequential Phase 2.
+        The issue_16 fork-join approach calls Indexer.forward() directly
+        instead. Kept for potential future use.
+
+        Called from the mla_indexer_fork custom op (or externally) after
+        wq_b/wk/weights_proj have completed on their respective streams
+        and sync has occurred.
+        Handles: reshape, RoPE, FP8 quant, weight scaling, indexer_op.
+        """
+        q = q.view(-1, self.n_head, self.head_dim)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+        k_pe, k_nope = torch.split(
+            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
+
+        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = per_token_group_quant_fp8(
+            q,
+            self.quant_block_size,
+            column_major_scales=False,
+            use_ue8m0=self.scale_fmt is not None,
+        )
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_head, 1)
+
+        weights = (
+            weights.unsqueeze(-1)
+            * q_scale
+            * self.softmax_scale
+            * self.n_head**-0.5
+        )
+        weights = weights.squeeze(-1)
+
+        self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
 def _min_latency_fused_qkv_a_proj_impl(
@@ -843,6 +912,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -979,6 +1049,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            alt_stream=alt_stream,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1012,6 +1083,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -1062,6 +1134,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            **({"alt_stream": alt_stream} if alt_stream is not None else {}),
         )
 
         if (
@@ -1164,6 +1237,15 @@ class DeepseekV2Model(nn.Module):
         else:
             topk_indices_buffer = None
 
+        # Create alt_stream for multi-stream indexer parallelism.
+        # Single stream shared across ALL layers. Matches SGLang design.
+        if (self.is_v32
+                and current_platform.is_cuda_alike()
+                and vllm_config.model_config.use_mla):
+            self.alt_stream = torch.cuda.Stream()
+        else:
+            self.alt_stream = None
+
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -1176,7 +1258,8 @@ class DeepseekV2Model(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
-                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer,
+                alt_stream=self.alt_stream,
             ),
             prefix=f"{prefix}.layers",
         )
