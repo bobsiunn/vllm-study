@@ -67,6 +67,71 @@ Connector and LMCache files:
 - `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/`: native
   vLLM adapter, multi-process adapter, and LMCache utility bridge.
 
+## Code Reading Path
+
+Follow this order when you move from the source map into code. The point is to
+read the smallest ownership unit first, then trace one request across the
+scheduler and worker boundary.
+
+1. `vllm/v1/core/kv_cache_utils.py`
+   - Read `KVCacheBlock`, block hash helpers, and `FreeKVCacheBlockQueue`.
+   - Answer: what metadata lives on a block, and how does the free queue order
+     eviction candidates?
+2. `vllm/v1/core/block_pool.py`
+   - Read `BlockPool.__init__()`, `get_new_blocks()`, `touch()`,
+     `free_blocks()`, `cache_full_blocks()`, and `evict_blocks()`.
+   - Answer: when does a physical block become allocated, cached, evictable, or
+     invalidated?
+3. `vllm/v1/core/single_type_kv_cache_manager.py`
+   - Read `get_num_blocks_to_allocate()`, `allocate_new_computed_blocks()`,
+     `allocate_new_blocks()`, `cache_blocks()`, and `remove_skipped_blocks()`.
+   - Answer: how do full attention, sliding-window, and external computed tokens
+     change the block list for one KV cache group?
+4. `vllm/v1/core/kv_cache_coordinator.py`
+   - Read the coordinator selected by `get_kv_cache_coordinator()` for your
+     model shape, then follow `find_longest_cache_hit()`,
+     `get_num_blocks_to_allocate()`, `allocate_new_computed_blocks()`, and
+     `allocate_new_blocks()`.
+   - Answer: how are single-group and multi-group allocation decisions merged?
+5. `vllm/v1/core/kv_cache_manager.py`
+   - Read `KVCacheBlocks`, `get_computed_blocks()`, `can_fit_full_sequence()`,
+     `allocate_slots()`, `take_new_block_ids()`, `free()`, and
+     `evict_blocks()`.
+   - Answer: what scheduler-facing API hides all lower-level cache structures?
+6. `vllm/v1/core/sched/scheduler.py`
+   - Search within the file for `get_num_new_matched_tokens`, `allocate_slots`,
+     `update_state_after_alloc`, `kv_connector_metadata`,
+     `invalid_block_ids`, and `_handle_invalid_blocks`.
+   - Answer: where do local prefix hits, external connector hits, and failure
+     recovery enter scheduling?
+7. `vllm/v1/core/sched/output.py` and `vllm/v1/outputs.py`
+   - Read `NewRequestData`, `CachedRequestData`, `SchedulerOutput`,
+     `KVConnectorOutput`, and `ModelRunnerOutput.kv_connector_output`.
+   - Answer: which fields cross scheduler-to-worker and worker-to-scheduler?
+8. `vllm/v1/worker/gpu_input_batch.py` and `vllm/v1/worker/block_table.py`
+   - Read request add/remove/compact paths in `InputBatch`, then
+     `BlockTable.add_row()`, `append_row()`, `commit_block_table()`, and
+     `compute_slot_mapping()`.
+   - Answer: how do scheduler block IDs become worker rows and slot mappings?
+9. `vllm/v1/worker/gpu_model_runner.py`
+   - Search for `new_block_ids_to_zero`, `append_row`, `commit_block_table`,
+     `compute_slot_mapping`, `maybe_get_kv_connector_output`, and
+     `kv_connector_no_forward`.
+   - Answer: where are block tables committed, attention metadata built, and
+     connector output returned?
+10. `vllm/distributed/kv_transfer/kv_connector/v1/base.py` and
+    `vllm/v1/worker/kv_connector_model_runner_mixin.py`
+    - Read scheduler-side methods first, then worker-side lifecycle methods.
+    - Answer: which connector calls happen before allocation, after allocation,
+      around forward, and after forward?
+11. `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py` and
+    `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py`
+    - Read `LMCacheConnectorV1`, `RequestTracker`, `get_num_new_matched_tokens()`,
+      `update_state_after_alloc()`, `build_connector_meta()`, `start_load_kv()`,
+      `save_kv_layer()`, and `request_finished()`.
+    - Answer: where does vLLM allocation state become LMCache lookup, load, save,
+      and completion state?
+
 ## Core Mental Model
 
 Start with ownership boundaries:

@@ -69,6 +69,76 @@ Connector와 LMCache 파일:
 - `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/`: native
   vLLM adapter, multi-process adapter, LMCache utility bridge.
 
+## Code Reading Path
+
+Source map에서 실제 code로 들어갈 때는 아래 순서로 읽으세요. 가장 작은
+ownership 단위부터 읽고, 그 다음 하나의 request가 scheduler와 worker 경계를
+지나는 흐름을 따라가는 방식입니다.
+
+1. `vllm/v1/core/kv_cache_utils.py`
+   - `KVCacheBlock`, block hash helper, `FreeKVCacheBlockQueue`를 읽습니다.
+   - 확인할 것: block에는 어떤 metadata가 있고, free queue는 eviction
+     candidate의 순서를 어떻게 표현하나요?
+2. `vllm/v1/core/block_pool.py`
+   - `BlockPool.__init__()`, `get_new_blocks()`, `touch()`, `free_blocks()`,
+     `cache_full_blocks()`, `evict_blocks()`를 읽습니다.
+   - 확인할 것: physical block은 언제 allocated, cached, evictable,
+     invalidated 상태가 되나요?
+3. `vllm/v1/core/single_type_kv_cache_manager.py`
+   - `get_num_blocks_to_allocate()`, `allocate_new_computed_blocks()`,
+     `allocate_new_blocks()`, `cache_blocks()`, `remove_skipped_blocks()`를
+     읽습니다.
+   - 확인할 것: full attention, sliding-window, external computed token은 하나의
+     KV cache group block list를 어떻게 바꾸나요?
+4. `vllm/v1/core/kv_cache_coordinator.py`
+   - 내 model shape에서 `get_kv_cache_coordinator()`가 선택하는 coordinator를
+     먼저 보고, `find_longest_cache_hit()`, `get_num_blocks_to_allocate()`,
+     `allocate_new_computed_blocks()`, `allocate_new_blocks()`를 따라가세요.
+   - 확인할 것: single-group과 multi-group allocation decision은 어떻게
+     합쳐지나요?
+5. `vllm/v1/core/kv_cache_manager.py`
+   - `KVCacheBlocks`, `get_computed_blocks()`, `can_fit_full_sequence()`,
+     `allocate_slots()`, `take_new_block_ids()`, `free()`, `evict_blocks()`를
+     읽습니다.
+   - 확인할 것: 어떤 scheduler-facing API가 lower-level cache structure를
+     숨기나요?
+6. `vllm/v1/core/sched/scheduler.py`
+   - 파일 안에서 `get_num_new_matched_tokens`, `allocate_slots`,
+     `update_state_after_alloc`, `kv_connector_metadata`, `invalid_block_ids`,
+     `_handle_invalid_blocks`를 검색해서 읽습니다.
+   - 확인할 것: local prefix hit, external connector hit, failure recovery는
+     scheduling에 어디서 들어오나요?
+7. `vllm/v1/core/sched/output.py`와 `vllm/v1/outputs.py`
+   - `NewRequestData`, `CachedRequestData`, `SchedulerOutput`,
+     `KVConnectorOutput`, `ModelRunnerOutput.kv_connector_output`을 읽습니다.
+   - 확인할 것: 어떤 field가 scheduler-to-worker, worker-to-scheduler 경계를
+     넘나요?
+8. `vllm/v1/worker/gpu_input_batch.py`와 `vllm/v1/worker/block_table.py`
+   - `InputBatch`의 request add/remove/compact path를 읽고,
+     `BlockTable.add_row()`, `append_row()`, `commit_block_table()`,
+     `compute_slot_mapping()`을 읽습니다.
+   - 확인할 것: scheduler block ID는 어떻게 worker row와 slot mapping이
+     되나요?
+9. `vllm/v1/worker/gpu_model_runner.py`
+   - `new_block_ids_to_zero`, `append_row`, `commit_block_table`,
+     `compute_slot_mapping`, `maybe_get_kv_connector_output`,
+     `kv_connector_no_forward`를 검색해서 읽습니다.
+   - 확인할 것: block table commit, attention metadata build, connector output
+     return은 어디서 일어나나요?
+10. `vllm/distributed/kv_transfer/kv_connector/v1/base.py`와
+    `vllm/v1/worker/kv_connector_model_runner_mixin.py`
+    - scheduler-side method를 먼저 읽고, 그 다음 worker-side lifecycle method를
+      읽습니다.
+    - 확인할 것: 어떤 connector call이 allocation 전, allocation 후, forward
+      주변, forward 이후에 일어나나요?
+11. `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py`와
+    `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py`
+    - `LMCacheConnectorV1`, `RequestTracker`, `get_num_new_matched_tokens()`,
+      `update_state_after_alloc()`, `build_connector_meta()`, `start_load_kv()`,
+      `save_kv_layer()`, `request_finished()`를 읽습니다.
+    - 확인할 것: vLLM allocation state는 어디에서 LMCache lookup, load, save,
+      completion state가 되나요?
+
 ## Core Mental Model
 
 먼저 ownership boundary부터 잡으세요.
