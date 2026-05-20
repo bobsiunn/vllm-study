@@ -57,6 +57,11 @@ Scheduler와 worker handoff 파일:
 - `vllm/v1/worker/gpu_model_runner.py`: block-table update, slot mapping,
   attention metadata, block zeroing, connector output wrapping.
 
+현재 branch에는 `vllm/v1/worker/gpu/` 아래에도 model runner와 block table
+구현이 있습니다. 이 가이드는 안정적인 V1 top-level worker path를 먼저 따라가고,
+`worker/gpu/`는 같은 개념이 더 세분화된 parallel path로 필요할 때만
+대조해서 읽으세요.
+
 Connector와 LMCache 파일:
 
 - `vllm/distributed/kv_transfer/kv_connector/v1/base.py`: scheduler-side와
@@ -158,6 +163,17 @@ Container shape를 명확히 기억하세요. `KVCacheBlocks.blocks`는 KV cache
 group 기준으로 묶입니다. 따라서 `blocks[i][j]`는 `i`번째 KV cache group의
 `j`번째 block을 의미합니다. token-major 구조로 읽으면 안 됩니다.
 
+용어도 여기서 고정해두세요.
+
+- `block`: scheduler와 `BlockPool`이 할당, 참조 카운트, prefix-cache lookup을
+  관리하는 physical page 단위입니다. 하나의 block은 여러 token slot을 담습니다.
+- `slot`: block 안의 token 1개 저장 위치입니다. worker slot mapping은 결국
+  `block_number * block_size + local_block_offset` 형태의 physical KV 위치를
+  만듭니다.
+- `full block`: `block_size`개 token이 모두 확정된 block입니다. block hash는
+  이 full block 단위로만 정의되고, partial tail block은 prefix-cache 대상이
+  아닙니다.
+
 Checkpoint 질문:
 
 - 어떤 객체가 physical block lifetime을 소유하나요?
@@ -184,6 +200,12 @@ scheduling 시점의 layout을 이해하는 가장 좋은 local map입니다.
    block을 할당합니다.
 4. caching이 꺼져 있거나 async KV-transfer path 때문에 `delay_cache_blocks`가
    설정된 경우가 아니라면 full block을 즉시 cache합니다.
+
+주의할 점은 allocation과 실제 KV tensor write가 다르다는 것입니다.
+`allocate_slots()`는 scheduler-side block/slot 소유권을 예약하고 worker에게
+전달할 block ID를 준비합니다. 실제 K/V tensor는 이후 worker attention backend가
+`slot_mapping`을 사용해 KV cache tensor에 scatter-write합니다. 반대로
+`cache_full_blocks()`는 tensor write가 아니라 prefix-cache metadata 등록입니다.
 
 특히 다음 인자를 집중해서 보세요.
 
@@ -218,6 +240,27 @@ Checkpoint 질문:
 
 `null_block`은 특별합니다. skipped slot이나 out-of-window slot을 표현하며,
 일반 free-list block처럼 취급하면 안 됩니다.
+
+`block_hash` lifecycle은 scheduler-side prefix cache lookup을 위한 index로
+이해하세요.
+
+1. `Request.update_block_hashes()`가 request token이 늘어날 때 새 full block의
+   hash를 `request.block_hashes`에 추가합니다.
+2. `get_request_block_hasher()`는 `block_size`개 token이 모인 full block만
+   hash합니다. partial block은 아직 최종 내용이 확정되지 않았으므로 건너뜁니다.
+3. `BlockPool.cache_full_blocks()`가 해당 hash에 KV cache group id를 붙여
+   `KVCacheBlock.block_hash`에 저장하고 `cached_block_hash_to_block`에
+   삽입합니다.
+4. 다음 request의 prefix lookup에서는 `find_longest_cache_hit()`가
+   `request.block_hashes`를 앞에서부터 보며 `BlockPool.get_cached_block()`으로
+   physical cached block을 찾습니다.
+
+free queue의 방향도 같이 기억하세요. `BlockPool.get_new_blocks()`는 queue
+head에서 block을 꺼내므로 head가 먼저 evict/reuse되는 쪽입니다. 반대로
+`free_blocks()`는 ref count가 0이 된 block을 전달받은 순서대로 queue tail에
+붙입니다. 그래서 `SingleTypeKVCacheManager.free()`는 `reversed(req_blocks)`를
+넘겨 같은 request 안에서 tail block이 prefix block보다 먼저 eviction candidate가
+되게 합니다. 앞쪽 prefix block이 future prefix-cache hit에 더 유용하기 때문입니다.
 
 Checkpoint 질문:
 
@@ -293,6 +336,12 @@ worker는 scheduler block ID를 attention backend가 소비하는 tensor로
 Hybrid case에서는 allocation block size가 kernel block size보다 클 때
 `BlockTable.map_to_kernel_blocks()`가 하나의 KV-manager block ID를 여러
 attention-kernel block ID로 쪼갤 수 있습니다.
+
+`BlockTable`과 `slot_mapping`은 실제 KV read/write 위치를 설명하지만,
+prefix-cache hash table은 아닙니다. 어떤 block이 cached인지 판단하는 것은
+scheduler-side `BlockPool.cached_block_hash_to_block`이고, worker-side block
+table은 이미 선택된 block ID를 attention backend가 사용할 주소로 바꾸는
+역할을 합니다.
 
 Checkpoint 질문:
 
