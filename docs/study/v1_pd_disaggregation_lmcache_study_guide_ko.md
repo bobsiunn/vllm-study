@@ -152,20 +152,40 @@ request-level ownership handoff를 먼저 따라가세요.
      확인합니다.
    - 확인할 것: prefill response에서 나온 `kv_transfer_params`는 decode request의
      어느 field로 들어가나요?
-3. `vllm/config/kv_transfer.py`
-   - `KVTransferConfig`, `is_kv_transfer_instance`, producer/consumer/both role
-     helper를 읽습니다.
-   - 확인할 것: `kv_role`은 local cache behavior가 아니라 connector behavior를
-     어떻게 제한하나요?
+3. `vllm/config/kv_transfer.py` (정의·검증만 — 동작 제한 코드는 소비처에 있음)
+   - `KVTransferConfig`, `is_kv_transfer_instance` / `is_kv_producer` /
+     `is_kv_consumer` property(109~119), `__post_init__`의 검증(kv_connector를
+     켜면 kv_role 필수, 103~107)을 읽습니다.
+   - 확인할 것: `kv_role`이 실제 동작을 제한하는 곳은 helper **소비처**입니다.
+     ① `is_kv_transfer_instance` → KV transfer on/off 자체
+     (`v1/attention/selector.py:87`, `kv_transfer_state.py:78`, `config/vllm.py`),
+     ② `is_kv_producer`/`is_kv_consumer` → connector 내부 send/recv 분기
+     (`mooncake`/`p2p`/`moriio` connector). 단 **NIXL은 kv_role을 쓰지 않고**
+     per-request `do_remote_decode`/`do_remote_prefill`로 방향을 정합니다
+     (`nixl/scheduler.py:602`) — role 게이팅 방식이 connector마다 다릅니다.
 4. `vllm/config/vllm.py`와 `vllm/engine/arg_utils.py`
-   - `kv_transfer_config` post-init, compatibility check, CLI argument parsing을
-     읽습니다.
+   - `arg_utils.py`는 `--kv-transfer-config` JSON을 `KVTransferConfig`로
+     파싱·전달만 합니다(`arg_utils.py:1474, 2245`). 실제 게이팅은 전부
+     `config/vllm.py`에 있습니다: `_post_init_kv_transfer_config`(757),
+     `_verify_kv_transfer_compat`(804), HMA 자동 비활성화(1479~1500), CUDA graph
+     PIECEWISE 강등(1244~1269).
    - 확인할 것: connector가 켜질 때 어떤 기능이 제한되거나 자동 조정되나요?
-5. `vllm/entrypoints/openai/engine/serving.py`
-   - `has_kv_connector`, `_with_kv_transfer_rejection_cleanup()`,
-     `notify_kv_transfer_request_rejected()` 경로를 읽습니다.
+     → 정리된 표는 동반 문서
+     [Connector 통신 구조 §8](v1_pd_connector_communication_ko.md#8-connector를-켜면-바뀌는-것-제한자동조정)
+     참고. 요약: offload→connector 자동주입, CUDA graph→PIECEWISE, HMA 미지원 시
+     hybrid KV cache off (제한) / `expandable_segments`·routed-experts·일부
+     chunked-prefill 조합은 거부 (에러).
+5. `vllm/entrypoints/openai/engine/serving.py` → `async_llm.py` → `core.py` → connector
+   - 감지는 `serving.py:413` `_with_kv_transfer_rejection_cleanup`(ErrorResponse/예외
+     시 `notify_kv_transfer_request_rejected` 호출, 435)에서 시작하지만, 실제 block
+     free는 `async_llm.py:723`이 **`abort_immediately=True` 합성 요청**을 엔진에 넣어
+     (`core.py:373`) 평소의 `request_finished`(base.py:542) 훅을 재사용합니다.
+     P 블록은 `nixl/scheduler.py:609~620`에서 `do_remote_prefill`이 아직 True인 걸
+     단서로 풀립니다.
    - 확인할 것: engine admission 전에 request가 reject되면 remote-prefill block
-     cleanup은 어디서 시작되나요?
+     cleanup은 어디서 시작되나요? → 전체 흐름(sequence)은 동반 문서
+     [Connector 통신 구조 §8](v1_pd_connector_communication_ko.md#8-admission-전-reject-시-remote-prefill-block-cleanup)
+     참고.
 6. `vllm/entrypoints/serve/disagg/protocol.py`,
    `vllm/entrypoints/serve/disagg/serving.py`, `vllm/outputs.py`
    - request schema와 output schema에서 `kv_transfer_params`가 어떻게 보존되는지

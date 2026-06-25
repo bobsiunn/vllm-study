@@ -302,7 +302,88 @@ proxy ↔ P/D 사이를 오가는 메타데이터 필드 (proxy + `nixl/schedule
 > `remote_host`는 connector가 아니라 **proxy가** 응답 instance 주소로 채워 넣는다는
 > 점이 포인트 — connector는 자기 host를 모르고, 노드 간 라우팅은 proxy 책임.
 
-## 8. Code Map (v0.23.0)
+## 8. Admission 전 reject 시 remote-prefill block cleanup
+
+D측 요청이 **엔진에 들어가기 전에 거부**(검증 실패/과부하 등)되면, P 노드는 이미
+그 `request_id`용 prefill 블록을 lease로 pin해 둔 상태입니다. 아무도 안 알려주면
+lease/TTL 만료까지 **블록이 stranded**됩니다. vLLM은 전용 cleanup API를 만들지
+않고, **가짜 pre-aborted 요청을 엔진에 밀어넣어 평소의 `request_finished` 훅을
+재사용**해 이 블록을 조기 회수합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sv as serving (_with_kv_transfer_rejection_cleanup)
+    participant AL as AsyncLLM
+    participant EC as EngineCore
+    participant Sc as Scheduler
+    participant Cn as NIXL connector (sched-side)
+    participant Wk as worker-side connector
+    participant P as P node
+
+    Note over Sv: create_* 코루틴이 ErrorResponse/예외 반환<br/>= admission 전 reject (do_remote_prefill=True일 때만)
+    Sv->>AL: notify_kv_transfer_request_rejected(req_id, kv_params) — serving.py:435
+    Note over AL: 합성 EngineCoreRequest 생성<br/>abort_immediately=True, kv_params in extra_args — async_llm.py:733
+    AL->>EC: add_request_async(request)
+    EC->>Sc: add_request(request)
+    EC->>Sc: abort_requests([req_id]) → finish_requests(FINISHED_ABORTED) — core.py:373,384
+    Sc->>Cn: request_finished(request, block_ids) — base.py:542
+    Note over Cn: do_remote_prefill 아직 True<br/>(update_state_after_alloc 미호출) = 스케줄 전 abort
+    Cn->>Wk: _reqs_need_recv[req_id] = (request, []) — nixl/scheduler.py:618
+    Wk->>P: req_id 블록 풀어라 통지
+    Note over P: pin됐던 prefill 블록 회수 (lease 만료 전 조기 free)
+```
+
+읽는 순서:
+
+1. **감지** — `entrypoints/openai/engine/serving.py:413` `_with_kv_transfer_rejection_cleanup`.
+   `create_*` 코루틴을 감싸고(호출처: `chat_completion/serving.py:231`,
+   `completion/serving.py:124`, `responses/serving.py:327`), `has_kv_connector` +
+   `kv_transfer_params.do_remote_prefill`일 때만 동작(serving.py:422~423). awaitable이
+   `ErrorResponse`/예외면 `finally`에서 notify(435).
+2. **브리지** — `v1/engine/async_llm.py:723` `notify_kv_transfer_request_rejected`.
+   거부된 req를 **`abort_immediately=True`** 합성 `EngineCoreRequest`로 만들어 제출(746,748).
+3. **엔진 코어** — `v1/engine/core.py:373~376`. `add_request` 직후 `abort_immediately`면
+   `abort_requests` → `finish_requests(FINISHED_ABORTED)`(384).
+4. **scheduler→connector** — `request_finished`(base.py:542) 정상 경로 진입.
+5. **cleanup** — `nixl/scheduler.py:609~620`. 스케줄 전 abort라 `do_remote_prefill`이
+   아직 True → 빈 block_ids를 `_reqs_need_recv`에 넣어 worker가 P에 free 통지.
+
+> 핵심 설계: **전용 cleanup RPC 없음.** "스케줄 전 abort된 요청"을 `request_finished`
+> 훅이 `do_remote_prefill==True`로 식별해 정상 종료 경로에 흡수시킨다. 이게 §5의 free
+> 핸드셰이크가 실패 경로에서 재사용되는 모습이고, §7의 lease/TTL(proxy 450s < abort
+> 480s)은 이 통지가 유실됐을 때의 안전망이다.
+
+## 9. Connector를 켜면 바뀌는 것 (제한·자동조정)
+
+`--kv-transfer-config`로 connector가 켜지면 `VllmConfig` post-init에서 다른 기능이
+**에러로 막히거나(restriction)** **조용히 조정(auto-adjust)** 됩니다. `arg_utils.py`는
+`--kv-transfer-config` JSON을 `KVTransferConfig`로 파싱해 전달만 하고(`arg_utils.py:
+1474, 2245`), 실제 게이팅은 전부 `config/vllm.py`에 있습니다.
+
+### 자동조정 (조용히 바뀜)
+
+| 무엇 | 트리거 | 동작 | 위치 |
+| --- | --- | --- | --- |
+| **connector 자동 선택** | `cache_config.kv_offloading_size` 설정 | kv_transfer_config 없으면 생성 후 backend별로 `OffloadingConnector`/`SimpleCPUOffloadConnector`/`LMCacheMPConnector` 지정 + `kv_role="kv_both"` | `vllm.py:774~802` (`_post_init_kv_transfer_config`) |
+| **CUDA graph 강등** | connector가 `requires_piecewise_for_cudagraph` + full graph 모드 | `cudagraph_mode` → **PIECEWISE** (layerwise async op은 graph capture 불가), `warning_once` | `vllm.py:1244~1269` |
+| **Hybrid KV cache(HMA) 비활성화** | connector가 `SupportsHMA` 미구현 | `disable_hybrid_kv_cache_manager=True`. 영향: hybrid SSM(Jamba/Bamba)은 HMA 필수라 **startup 실패**, sliding-window attention은 **성능 저하** | `vllm.py:1479~1500` |
+
+### 제한 (에러로 막음)
+
+| 무엇 | 조건 | 이유 | 위치 |
+| --- | --- | --- | --- |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | KV connector + cumem allocator 꺼짐 | CUDA VMM이 KV 가상주소를 다른 물리 페이지로 remap → pinned/registered 메모리(NIXL/Mooncake의 IB region) 무효화 → 첫 노드 간 전송에서 RDMA 실패 | `vllm.py:804~845` (`_verify_kv_transfer_compat`) |
+| `--enable-return-routed-experts` | `is_kv_transfer_instance` | PD: P에 캡처된 routing이 D에 도달 못함 / offload: KV가 GPU 밖이면 slot_mapping 의미가 바뀌어 slot-indexed buffer 깨짐 | `vllm.py:874~886` |
+| chunked prefill | `ExampleHiddenStatesConnector` + chunked prefill | 이 connector가 chunked prefill 미지원 | `vllm.py:763~772` |
+
+> 정리: connector를 켜면 (1) offload 경로는 connector를 **자동 주입**하고, (2) CUDA
+> graph는 **PIECEWISE로 내려가며**, (3) connector가 HMA 미지원이면 hybrid KV cache가
+> **꺼지고**, (4) `expandable_segments`·routed-experts·일부 chunked-prefill 조합은
+> **아예 거부**됩니다. 핵심 동인은 connector가 KV 메모리를 pin/register하고
+> layer 단위 async 전송을 한다는 점입니다.
+
+## 10. Code Map (v0.23.0)
 
 | 심볼 / 필드 | 위치 | 역할 |
 | --- | --- | --- |
@@ -323,13 +404,21 @@ proxy ↔ P/D 사이를 오가는 메타데이터 필드 (proxy + `nixl/schedule
 | `request_finished` | `base.py:542` | (sched) 종료 시 block free 지연 + `kv_transfer_params` |
 | `get_block_ids_with_load_errors` | `base.py:375` | (worker) load 실패 block 보고 |
 | `maybe_transfer_kv_layer` (데코레이터) | `model_executor/layers/attention/kv_transfer_utils.py:15` | attention forward를 감싸 layer hook 호출 |
+| `_post_init_kv_transfer_config` | `config/vllm.py:757` | offload→connector 자동 주입, kv_role=kv_both |
+| `_verify_kv_transfer_compat` | `config/vllm.py:804` | expandable_segments 비호환 거부 |
+| HMA 자동 비활성화 | `config/vllm.py:1479~1500` | connector가 `SupportsHMA` 미구현 시 |
+| CUDA graph → PIECEWISE | `config/vllm.py:1244~1269` | `requires_piecewise_for_cudagraph` 시 |
+| `_with_kv_transfer_rejection_cleanup` | `openai/engine/serving.py:413` | admission-전 reject 감지→notify |
+| `notify_kv_transfer_request_rejected` | `v1/engine/async_llm.py:723` | `abort_immediately` 합성 요청 제출 |
+| `abort_immediately` 처리 | `v1/engine/core.py:373` | add 직후 abort→`request_finished` 유도 |
+| reject cleanup 분기 | `nixl/scheduler.py:609~620` | `do_remote_prefill` still-True → P 블록 free |
 | `do_remote_decode` / `do_remote_prefill` 해석 | `nixl/scheduler.py:602` | `is_p_node`/`is_d_node` 방향 결정 |
 | `request_finished` 반환 params | `nixl/scheduler.py:664` | `remote_block_ids/engine_id/request_id` 생성 |
 | block lease/TTL pin | `nixl/scheduler.py:642~655` | `_reqs_need_send` + lease로 블록 회수 지연 |
 | `ConversationKVCache` | `examples/.../disagg_proxy_multiturn.py:83` | proxy의 conv별 D-params 캐시 (단일사용+TTL) |
 | `_send_to_prefill` / `_stream_from_decode` | `disagg_proxy_multiturn.py:178/204` | P=non-stream max_tokens=1, D=stream+params 캡처 |
 
-## 9. 한 줄 요약
+## 11. 한 줄 요약
 
 > **instance 내부** scheduler↔worker = 엔진의 `SchedulerOutput`/`ModelRunnerOutput`
 > 배관에 `KVConnectorMetadata`(↓)·`KVConnectorOutput`(↑)을 실어 통신.
