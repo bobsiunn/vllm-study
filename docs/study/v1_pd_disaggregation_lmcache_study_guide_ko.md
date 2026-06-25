@@ -4,7 +4,9 @@
     이 문서는 구현 설계서가 아니라 학습 로드맵입니다. V1 KV cache core를
     읽은 뒤, 노드 간 prefill/decode disaggregation serving에서 요청, KV
     metadata, connector, LMCache 경계가 어떻게 이어지는지 이해하는 데
-    사용하세요.
+    사용하세요. scheduler-side/worker-side connector의 실제 통신 경로를 그림으로
+    보려면 동반 문서 [V1 P/D Connector 통신 구조](v1_pd_connector_communication_ko.md)를
+    참고하세요.
 
 !!! warning "Baseline"
     이 가이드는 upstream **`v0.23.0`** 트리에 대해 모든 source-map 경로와 핵심
@@ -40,11 +42,17 @@ connector state를 정리하는 흐름까지 한 요청을 따라갈 수 있어�
 
 - [V1 KV Cache와 LMCache Connector 학습 가이드](v1_kv_cache_lmcache_study_guide_ko.md):
   local KV block allocation, worker block table, LMCache connector entry point.
-- `vllm/distributed/kv_transfer/kv_connector/v1/base.py`의 `KVConnectorRole`과
-  `KVConnectorBase_V1` docstring: prefill instance(= KV producer), decode
-  instance(= KV consumer), scheduler connector, worker connector 용어의 V1 기준
-  정의. (구 `disagg_prefill.md`는 Connector→LookupBuffer→Pipe라는 V0 모델을
-  설명하므로 용어 출처로 쓰지 마세요.)
+- 용어의 V1 기준 출처(두 파일):
+    - `vllm/config/kv_transfer.py`의 `kv_role`(`kv_producer` / `kv_consumer` /
+      `kv_both`)과 `is_kv_producer()` / `is_kv_consumer()` 헬퍼 → producer 측(=
+      prefill instance)과 consumer 측(= decode instance)을 정의. 코드에
+      "prefill/decode instance"라는 심볼이 따로 있는 게 아니라, instance의
+      `kv_role`로 그 역할이 표현됩니다.
+    - `vllm/distributed/kv_transfer/kv_connector/v1/base.py`의
+      `KVConnectorRole`(SCHEDULER / WORKER) → scheduler connector와 worker
+      connector를 정의 (같은 connector를 두 role로 띄운 것).
+  (구 `disagg_prefill.md`는 Connector→LookupBuffer→Pipe라는 V0 모델을 설명하므로
+  용어 출처로 쓰지 마세요.)
 - [NixlConnector Usage Guide](features/nixl_connector_usage.md): 노드 간 KV
   transfer, side channel, producer/consumer role, `kv_transfer_params` 예시.
 - [Automatic Prefix Caching](design/prefix_caching.md): local prefix cache hit과
@@ -124,13 +132,20 @@ LMCache와 비교용 connector 파일:
 V1 core KV cache를 이미 읽었다면, 이제는 local block ownership보다
 request-level ownership handoff를 먼저 따라가세요.
 
-1. V1 용어 정의: `vllm/distributed/kv_transfer/kv_connector/v1/base.py`
-   - `KVConnectorRole`(SCHEDULER / WORKER)과 `KVConnectorBase_V1` docstring에서
-     `prefill instance`(producer), `decode instance`(consumer),
-     `scheduler connector`, `worker connector` 정의를 읽습니다. scheduler/worker
-     connector는 별개 클래스가 아니라 같은 connector를 두 role로 띄운 것입니다.
-   - 확인할 것: P와 D가 별도 vLLM instance일 때 connector가 왜 scheduler-side와
-     worker-side로 나뉘나요?
+1. V1 용어 정의 (두 파일에서 따로 읽습니다)
+   - `vllm/config/kv_transfer.py`: `kv_role`(`kv_producer` / `kv_consumer` /
+     `kv_both`)과 `is_kv_producer()` / `is_kv_consumer()`가 producer 측(=
+     `prefill instance`)과 consumer 측(= `decode instance`)을 정의합니다.
+     코드에 "prefill/decode instance" 심볼은 없고, instance의 `kv_role`이 그
+     역할을 표현합니다.
+   - `vllm/distributed/kv_transfer/kv_connector/v1/base.py`의
+     `KVConnectorRole`(SCHEDULER / WORKER): `scheduler connector`와
+     `worker connector`는 별개 클래스가 아니라 같은 connector를 두 role로 띄운
+     것입니다.
+   - 확인할 것: 한 vLLM instance의 `kv_role`(producer/consumer)과 그 안의
+     connector `KVConnectorRole`(scheduler/worker)은 서로 다른 축의 역할입니다.
+     P와 D가 별도 instance일 때 connector가 왜 scheduler-side와 worker-side로
+     나뉘나요?
 2. `examples/disaggregated/disaggregated_serving/`와
    `examples/disaggregated/lmcache/`
    - proxy가 prefill server와 decode server에 어떤 순서로 request를 보내는지
