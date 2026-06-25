@@ -219,34 +219,71 @@ multiturn proxy의 진짜 포인트는 **이전 turn의 KV가 D에 남아 있다
   "lease/TTL 만료" 항목의 실제 구현입니다.)
 - `conversation_id`가 없으면 cross-turn 재사용 비활성화 → 매 turn 재계산(py:372).
 
-### Turn N+1 흐름 (양방향)
+### 전체 흐름 (Step 0 ~ 끝, `_handle_request` 기준)
+
+HIT(turn N+1) / MISS(첫 turn)와 SSE 스트리밍까지 한 장에 담았습니다.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Cl as client
-    participant Px as proxy (ConversationKVCache)
+    participant Px as proxy (_handle_request)
+    participant Ca as ConversationKVCache
     participant P as Prefill instance
     participant D as Decode instance
 
-    Note over Px: 이전 turn에서 D의 kv_transfer_params를<br/>conversation_id로 캐시해 둠
-    Cl->>Px: turn N+1 요청 (같은 conversation_id)
-    Px->>Px: kv_cache.get(conv_id) → D 블록 정보 HIT (pop, 단일사용)
-    Note over Px: cached_kv에<br/>do_remote_decode=True, do_remote_prefill=False 설정<br/>(D의 remote_block_ids 유지)
-    Px->>P: prefill 요청 + D의 블록 정보 (stream=False, max_tokens=1)
-    P->>D: ① worker가 D의 이전-turn KV를 PULL (역방향 재사용)
-    Note over P: 공유 prefix 재계산 생략 + 새 토큰만 prefill<br/>request_finished → P 블록 pin
-    P-->>Px: P의 kv_transfer_params (do_remote_prefill=True + P block 정보)
-    Px->>D: decode 요청 + P의 블록 정보 (stream=True)
-    D->>P: ② worker가 P의 KV를 PULL (정방향)
-    D-->>Px: SSE 스트림 + 마지막 chunk에 D의 새 kv_transfer_params
-    Px->>Px: kv_cache.put(conv_id, D params) — 다음 turn용 갱신
-    Px-->>Cl: 최종 응답
+    Note over Px: Step 0 — 준비
+    Cl->>Px: POST /v1/chat/completions (conversation_id, stream?)
+    Px->>Px: conversation_id = body.pop(), client_wants_stream 판정
+
+    Note over Px: Step 1 — 직전 turn의 D 블록 조회
+    Px->>Ca: get(conversation_id) — pop, 단일사용
+    alt 캐시 HIT (turn N+1)
+        Ca-->>Px: D의 kv_transfer_params
+        Px->>Px: do_remote_decode=True, do_remote_prefill=False (D blocks 유지)
+    else 캐시 MISS (첫 turn) 또는 conversation_id 없음
+        Ca-->>Px: None
+        Px->>Px: do_remote_decode=True, remote_block_ids=None
+    end
+
+    Note over Px: Step 2 — Prefill 노드 (stream=False, max_tokens=1)
+    Px->>P: POST /v1/.. + kv_transfer_params
+    opt HIT일 때만 (bidirectional)
+        P->>D: ① P worker가 D의 이전-turn KV PULL (역방향)
+    end
+    Note over P: 새 토큰만 prefill, request_finished → 블록 lease pin
+    P-->>Px: 200 JSON + kv_transfer_params (do_remote_prefill=True, P blocks)
+    Px->>Px: p_kv_params["remote_host"] = P.host
+
+    Note over Px: Step 3 — Decode 노드 (stream=True, SSE)
+    Px->>D: POST /v1/.. (stream=True) + P blocks
+    D->>P: ② D worker가 P의 KV PULL (정방향)
+    loop SSE 청크 (aiter_lines)
+        D-->>Px: data: {delta/text} (토큰)
+        alt 스트리밍 클라이언트
+            Px-->>Cl: 그 줄 그대로 relay (_stream_from_decode_sse)
+        else 비스트리밍 클라이언트
+            Px->>Px: collected_text 누적 (_stream_from_decode)
+        end
+    end
+    D-->>Px: data: {finish_reason, kv_transfer_params} (마지막 청크)
+    Px->>Ca: put(conversation_id, D params + remote_host=D.host)
+    D-->>Px: data: [DONE]
+
+    Note over Px: 응답 마무리
+    alt 스트리밍 클라이언트
+        Px-->>Cl: [DONE]까지 relay 종료
+    else 비스트리밍 클라이언트
+        Px-->>Cl: JSONResponse (collected_text 조립)
+    end
 ```
 
-①(D→P)과 ②(P→D) 두 전송이 모두 일어나는 게 **bidirectional**입니다. P 노드가
-prefill 노드이면서 동시에 remote 블록을 읽을 수 있는 건 connector의
+①(D→P)과 ②(P→D) 두 전송이 모두 일어나는 게 **bidirectional**입니다(①은 HIT일
+때만). P 노드가 prefill 노드이면서 동시에 remote 블록을 읽을 수 있는 건 connector의
 `is_bidirectional_kv_xfer_enabled` 경로(`nixl/scheduler.py:449`) 덕분입니다.
+proxy↔D는 평범한 OpenAI **SSE 스트리밍**이고, proxy는 항상 D에 `stream=True`로
+요청해 토큰은 클라이언트로(relay 또는 누적), `kv_transfer_params`는 캐시로
+라우팅합니다.
 
 ### `kv_transfer_params` 필드 인벤토리
 
