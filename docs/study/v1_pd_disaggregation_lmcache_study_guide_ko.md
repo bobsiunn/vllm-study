@@ -6,6 +6,16 @@
     metadata, connector, LMCache 경계가 어떻게 이어지는지 이해하는 데
     사용하세요.
 
+!!! warning "Baseline"
+    이 가이드는 upstream **`v0.23.0`** 트리에 대해 모든 source-map 경로와 핵심
+    심볼(`KVConnectorRole`, `KVConnectorBase_V1.{get_num_new_matched_tokens,
+    update_state_after_alloc, build_connector_meta, wait_for_layer_load,
+    save_kv_layer, request_finished}`, attention hook `maybe_transfer_kv_layer`)이
+    검증되었습니다. KV transfer connector 추상화는 V1 (`KVConnectorBase_V1`)
+    기준입니다. 구 `docs/features/disagg_prefill.md`의 "Development"
+    섹션(Connector → LookupBuffer → Pipe 3계층)은 **V0 모델**이며 현재 코드에
+    존재하지 않으므로 이 가이드에서는 참조하지 않습니다.
+
 ## 목표
 
 이 가이드는 다음 네 가지 연결된 흐름에 대한 코드 레벨 mental model을
@@ -30,8 +40,11 @@ connector state를 정리하는 흐름까지 한 요청을 따라갈 수 있어�
 
 - [V1 KV Cache와 LMCache Connector 학습 가이드](v1_kv_cache_lmcache_study_guide_ko.md):
   local KV block allocation, worker block table, LMCache connector entry point.
-- [Disaggregated Prefilling](features/disagg_prefill.md): prefill instance,
-  decode instance, scheduler connector, worker connector 용어.
+- `vllm/distributed/kv_transfer/kv_connector/v1/base.py`의 `KVConnectorRole`과
+  `KVConnectorBase_V1` docstring: prefill instance(= KV producer), decode
+  instance(= KV consumer), scheduler connector, worker connector 용어의 V1 기준
+  정의. (구 `disagg_prefill.md`는 Connector→LookupBuffer→Pipe라는 V0 모델을
+  설명하므로 용어 출처로 쓰지 마세요.)
 - [NixlConnector Usage Guide](features/nixl_connector_usage.md): 노드 간 KV
   transfer, side channel, producer/consumer role, `kv_transfer_params` 예시.
 - [Automatic Prefix Caching](design/prefix_caching.md): local prefix cache hit과
@@ -111,9 +124,11 @@ LMCache와 비교용 connector 파일:
 V1 core KV cache를 이미 읽었다면, 이제는 local block ownership보다
 request-level ownership handoff를 먼저 따라가세요.
 
-1. `docs/features/disagg_prefill.md`
-   - `prefill instance`, `decode instance`, `scheduler connector`, `worker
-     connector` 정의를 읽습니다.
+1. V1 용어 정의: `vllm/distributed/kv_transfer/kv_connector/v1/base.py`
+   - `KVConnectorRole`(SCHEDULER / WORKER)과 `KVConnectorBase_V1` docstring에서
+     `prefill instance`(producer), `decode instance`(consumer),
+     `scheduler connector`, `worker connector` 정의를 읽습니다. scheduler/worker
+     connector는 별개 클래스가 아니라 같은 connector를 두 role로 띄운 것입니다.
    - 확인할 것: P와 D가 별도 vLLM instance일 때 connector가 왜 scheduler-side와
      worker-side로 나뉘나요?
 2. `examples/disaggregated/disaggregated_serving/`와
@@ -158,9 +173,13 @@ request-level ownership handoff를 먼저 따라가세요.
      실행하는지 읽습니다.
    - 확인할 것: connector가 no-forward path를 만들 수 있는 조건은 무엇인가요?
 10. `vllm/model_executor/layers/attention/kv_transfer_utils.py`
-    - `maybe_wait_for_kv_layer_load()`와 `maybe_save_kv_layer()`를 읽습니다.
+    - attention layer forward를 감싸는 `maybe_transfer_kv_layer()` 데코레이터를
+      읽습니다. 이 wrapper는 진입 시 `connector.wait_for_layer_load(layer_name)`,
+      종료 시 `connector.save_kv_layer(layer_name, kv_cache, attn_metadata)`를
+      호출하며, V1 KV transfer group이 없으면 no-op이 됩니다.
     - 확인할 것: remote KV load가 attention computation보다 반드시 먼저
-      완료되어야 하는 layer-level boundary는 어디인가요?
+      완료되어야 하는 layer-level boundary는 어디인가요? (`wait_for_layer_load`가
+      `func()` 실행 앞에 있는 이유)
 11. `vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py`
     - 최소 구현으로 V1 connector API의 control flow를 확인합니다.
     - 확인할 것: example은 어떤 부분을 단순화하고, production connector에서는
@@ -318,7 +337,9 @@ Checkpoint 질문:
 
 1. 기존 V1 KV cache guide의 `Allocation Flow`와 `Connector` 부분을 다시
    훑어 local block ownership을 복습합니다.
-2. `disagg_prefill.md`와 예제 proxy를 읽어 request-level P/D 흐름을 그립니다.
+2. `examples/disaggregated/`의 proxy 예제를 읽어 request-level P/D 흐름을
+   그립니다. (P/D 용어는 `disagg_prefill.md` 대신 `KVConnectorBase_V1` /
+   `KVConnectorRole` 기준으로 잡습니다.)
 3. `KVTransferConfig`와 serving layer에서 `kv_transfer_params`의 입출력 경계를
    확인합니다.
 4. `KVConnectorBase_V1`와 scheduler integration을 읽어 external KV hit이
