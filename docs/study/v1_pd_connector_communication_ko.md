@@ -202,6 +202,34 @@ sequenceDiagram
   `do_remote_decode=True` ⇒ 그 노드는 **Prefill 노드**(`is_p_node`),
   `do_remote_prefill=True` ⇒ 그 노드는 **Decode 노드**(`is_d_node`, remote KV fetch).
 
+### 제어 평면 vs 데이터 평면 — serving은 metadata만 운반
+
+serving layer가 나르는 건 **오직 `kv_transfer_params: dict[str, Any]` 하나**입니다.
+remote KV의 위치/식별 정보(block ids, engine id, host/port, request id, do_remote_*
+플래그)를 담은 **불투명 JSON**이고, serving 단은 그 내용을 해석하지 않습니다. KV
+tensor는 이 경로를 절대 통과하지 않습니다.
+
+`kv_transfer_params`가 schema를 가로지르며 보존되는 흐름:
+
+| 단계 | 위치 | 형태 |
+| --- | --- | --- |
+| Request schema (들어올 때) | `serve/disagg/protocol.py:112` `GenerateRequest.kv_transfer_params` | `dict[str, Any] \| None` |
+| Engine output carrier | `vllm/outputs.py:123,143` `RequestOutput.kv_transfer_params` | 같은 dict (출처 = `request_finished` 반환값) |
+| 스트리밍 병합 | `vllm/outputs.py:149` `RequestOutput.add()` | 항상 **최신 chunk 값으로 덮음** (proxy의 "마지막 chunk 캡처"와 대응) |
+| Response schema (나갈 때) | `serve/disagg/protocol.py:208` + `serve/disagg/serving.py:325` | `final_res.kv_transfer_params`를 그대로 복사 |
+
+```mermaid
+flowchart LR
+    req["client/proxy JSON<br/>kv_transfer_params (dict)"] --> eng["engine"]
+    eng --> ro["RequestOutput<br/>.kv_transfer_params"]
+    ro --> resp["response JSON<br/>kv_transfer_params (dict)"]
+    eng -.->|"KV 바이트는 이 평면을 안 탐"| note["worker↔worker<br/>connector transport (축 2b)"]
+```
+
+> 핵심: **제어 평면(metadata)은 HTTP/serving**을 타고, **데이터 평면(KV 바이트)은
+> connector transport**를 탑니다. serving은 데이터 평면을 전혀 모른 채 metadata
+> 봉투만 pass-through합니다 — 이 분리가 P/D 아키텍처의 근간입니다.
+
 ## 7. Multi-turn bidirectional KV transfer
 
 multiturn proxy의 진짜 포인트는 **이전 turn의 KV가 D에 남아 있다는 것**입니다.

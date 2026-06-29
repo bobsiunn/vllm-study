@@ -188,20 +188,31 @@ request-level ownership handoff를 먼저 따라가세요.
      참고.
 6. `vllm/entrypoints/serve/disagg/protocol.py`,
    `vllm/entrypoints/serve/disagg/serving.py`, `vllm/outputs.py`
-   - request schema와 output schema에서 `kv_transfer_params`가 어떻게 보존되는지
-     읽습니다.
+   - `GenerateRequest.kv_transfer_params`(`protocol.py:112`) → 엔진 →
+     `RequestOutput.kv_transfer_params`(`outputs.py:123,143`; `add()`는 최신값 유지,
+     149) → `GenerateResponse.kv_transfer_params`(`protocol.py:208`,
+     `serving.py:325`)로 **`dict[str, Any]`가 그대로 보존**되는 흐름을 읽습니다.
    - 확인할 것: serving layer는 KV tensor를 알지 못하면서 어떤 metadata만
-     운반하나요?
+     운반하나요? → **제어 평면(metadata)/데이터 평면(KV 바이트) 분리**. 정리는
+     동반 문서
+     [Connector 통신 구조 §6 "제어 평면 vs 데이터 평면"](v1_pd_connector_communication_ko.md#제어-평면-vs-데이터-평면--serving은-metadata만-운반)
+     참고.
 7. `vllm/distributed/kv_transfer/kv_connector/v1/base.py`
    - scheduler-side method와 worker-side method를 나누어 읽습니다.
    - 확인할 것: allocation 전 lookup, allocation 후 metadata build, forward 전
      load, forward 후 save, request finish cleanup이 각각 어떤 API에 대응하나요?
 8. `vllm/v1/core/sched/scheduler.py`
-   - `get_num_new_matched_tokens`, `update_state_after_alloc`,
-     `build_connector_meta`, `request_finished`, `invalid_block_ids`를 검색해서
-     읽습니다.
+   - connector scheduler-side hook들이 `schedule()`(forward 전)과
+     `update_from_output()`(forward 후)에 어떻게 박혀 있는지 봅니다:
+     `get_num_new_matched_tokens`(:618), `update_state_after_alloc`(:788),
+     `build_connector_meta`(:955) / `request_finished`(:2126),
+     `invalid_block_ids`(:1358).
    - 확인할 것: local prefix hit과 external KV hit은 scheduling decision에서
-     어디서 합쳐지고 어디서 분리되나요?
+     어디서 합쳐지고 어디서 분리되나요? → **합류: `num_computed_tokens = local +
+     external`(:639~641)** 한 곳뿐, 그 외(산출·할당·async load·실패·종료)는 전부
+     분리. 전체 흐름과 표는
+     [Scheduler `schedule()` 흐름 §6](v1_scheduler_schedule_flow_ko.md#6-connector-scheduler-side가-scheduler-안에서-동작하는-법)
+     참고.
 9. `vllm/v1/worker/kv_connector_model_runner_mixin.py`와
    `vllm/v1/worker/gpu/kv_connector.py`
    - worker가 connector metadata를 받아 forward 주변에서 어떤 lifecycle을
