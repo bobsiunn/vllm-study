@@ -137,6 +137,15 @@ sequenceDiagram
 - 두 변형(`no_forward` = forward 없는 KV step, `defer_finalize` = spec decode에서 finalize
   지연)과 execute_model 오케스트레이션 상세는 **[Worker 흐름 §4](v1_worker_execute_model_flow_ko.md)** 참고.
 
+!!! note "V1 / V2 worker는 같은 connector를 다르게 감싼다"
+    worker는 두 model runner가 있습니다. **V1(안정·기본)** 은 contextmanager
+    `_get_kv_connector_output`(`kv_connector_model_runner_mixin.py`)로, **V2(실험적,
+    active dev)** 는 `gpu/kv_connector.py`의 `KVConnector`/`ActiveKVConnector` 클래스
+    (`pre_forward`/`post_forward`/`no_forward`)로 같은 lifecycle을 감쌉니다. V2의 그것은
+    connector 구현이 아니라 **distributed connector(`KVConnectorBase_V1`)를 보유한 래퍼**
+    입니다. 통합 흐름(이하 ★)은 둘 다 동일하게 적용됩니다. 비교·선택 로직은
+    [Worker 흐름 §4.5](v1_worker_execute_model_flow_ko.md) 참고.
+
 ### 통합 lifecycle — scheduler ↔ worker 한 바퀴 ★
 
 엔진 1 step에서 **scheduler-side(계획·사후처리)** 와 **worker-side(실행)** 가 어떻게

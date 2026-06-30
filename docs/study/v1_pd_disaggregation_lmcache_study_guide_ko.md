@@ -99,8 +99,11 @@ Scheduler와 worker integration 파일:
   connector metadata field를 확인합니다.
 - `vllm/v1/worker/kv_connector_model_runner_mixin.py`: model runner forward
   주변에서 connector lifecycle을 실행합니다.
-- `vllm/v1/worker/gpu/kv_connector.py`: GPU worker와 connector 사이의 V1
-  integration path입니다.
+- `vllm/v1/worker/gpu/kv_connector.py`: **실험적 Model Runner V2**(`worker/gpu/`)
+  전용의 connector 래퍼입니다. connector 구현이 아니라, `KVConnectorBase_V1`을
+  `get_kv_transfer_group()`로 보유하고 `pre_forward`/`post_forward`/`no_forward`로
+  감싸는 worker-side 어댑터 — 안정 경로(V1)의
+  `kv_connector_model_runner_mixin.py`에 대응합니다.
 - `vllm/model_executor/layers/attention/kv_transfer_utils.py`: attention layer
   진입 전 `wait_for_layer_load()`, 종료 후 `save_kv_layer()`를 호출합니다.
 
@@ -213,11 +216,13 @@ request-level ownership handoff를 먼저 따라가세요.
      분리. 전체 흐름과 표는
      [Scheduler `schedule()` 흐름 §6](v1_scheduler_schedule_flow_ko.md#6-connector-scheduler-side가-scheduler-안에서-동작하는-법)
      참고.
-9. `vllm/v1/worker/kv_connector_model_runner_mixin.py`와
-   `vllm/v1/worker/gpu/kv_connector.py`
-   - worker가 connector metadata를 받아 forward 주변에서 어떤 lifecycle을
-     실행하는지 읽습니다.
+9. `vllm/v1/worker/kv_connector_model_runner_mixin.py`(**V1, 안정·기본**)와
+   `vllm/v1/worker/gpu/kv_connector.py`(**V2, 실험적**)
+   - 두 model runner가 같은 connector lifecycle을 어떻게 다르게 감싸는지 봅니다:
+     V1은 contextmanager `_get_kv_connector_output`, V2는 `pre_forward`/
+     `post_forward`/`no_forward` 메서드 분리(같은 distributed connector를 호출).
    - 확인할 것: connector가 no-forward path를 만들 수 있는 조건은 무엇인가요?
+     (양쪽 모두 forward할 토큰이 0인데 KV transfer는 해야 할 때.)
 10. `vllm/model_executor/layers/attention/kv_transfer_utils.py`
     - attention layer forward를 감싸는 `maybe_transfer_kv_layer()` 데코레이터를
       읽습니다. 이 wrapper는 진입 시 `connector.wait_for_layer_load(layer_name)`,

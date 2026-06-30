@@ -263,6 +263,46 @@ sequenceDiagram
 - `self.kv_connector_output`이 execute_model(4359)에서 stash되어 sample_tokens(4388/4567)로
   넘어가는 것도, 두 메서드(+draft)에 걸쳐 connector output을 보존하기 위함.
 
+## 4.5 V1 mixin vs V2 wrapper — 같은 lifecycle, 다른 모양
+
+worker에는 model runner가 **두 구현**이 있고, 각자 connector worker-side lifecycle을
+다르게 감쌉니다. 둘 다 **같은 distributed connector(`KVConnectorBase_V1`)** 를 호출하며,
+모양만 다릅니다.
+
+| | **V1 (안정·기본)** | **V2 (실험적, active dev)** |
+| --- | --- | --- |
+| model runner | `gpu_model_runner.py` | `gpu/model_runner.py` (Model Runner V2) |
+| connector 감싸기 | `kv_connector_model_runner_mixin.py`의 contextmanager `_get_kv_connector_output` | `gpu/kv_connector.py`의 `KVConnector`/`ActiveKVConnector` 클래스 |
+| enter | (cm) bind+start_load (mixin:89,95) | `pre_forward` (gpu/kv_connector.py:61) |
+| exit | (cm) finally: wait_for_save+수확+clear (mixin:98~112) | `post_forward` (gpu/kv_connector.py:77) |
+| no-forward | `kv_connector_no_forward` (mixin:35) | `no_forward` (gpu/kv_connector.py:98) |
+| group 없음 | `maybe_get_*`의 nullcontext | `NO_OP_KV_CONNECTOR` (다형성) + `get_kv_connector` 팩토리 (:116) |
+| disable | (없음) | `set_disabled` — `_KV_CONNECTOR_AGENT` 토글로 layer hook 차단 (:107) |
+
+핵심: V2의 `gpu/kv_connector.py`는 **connector 구현이 아니라 래퍼**입니다 —
+`ActiveKVConnector.__init__`에서 `self.kv_connector = get_kv_transfer_group()`(:52)로
+진짜 connector를 보유하고, `register_kv_caches`까지 해줍니다. 즉 V1 mixin이 하던 일을
+**contextmanager 대신 pre/post 메서드 + 다형성 클래스**로 재구성한 것 (V2의 "모듈성·
+명시적 경계 우선" 방향).
+
+### 어느 게 도는가 (선택 로직)
+
+```python
+# config/vllm.py:519~542  use_v2_model_runner
+if envs.VLLM_USE_V2_MODEL_RUNNER is not None:        # 1) env로 명시하면 그대로
+    return ...
+if not _is_default_v2_model_runner_model(): return False   # 2) allowlist 모델만 기본 V2
+    # runner_type=="generate" + arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES + not MoE + not quantized
+if not HAS_TRITON: return False                      # 3) Triton 필요
+if self._get_v2_model_runner_unsupported_features(): return False  # 4) 미지원 기능 있으면 V1
+return True
+```
+
+→ **V2는 active development 방향**이고 일부 모델(generate·특정 arch·non-MoE·
+non-quantized)에 한해 **기본값으로 점진 확대 중**이지만, 그 외(MoE·양자화·미지원 기능·
+Triton 없음)는 여전히 **V1이 기본/폴백**입니다. worker 측 KV 모델 selector도 미지원
+케이스에선 V1을 고릅니다 (`gpu_worker.py:302~341`).
+
 ## 5. Code Map (v0.23.0)
 
 | 심볼 | 위치 | 역할 |
@@ -279,8 +319,11 @@ sequenceDiagram
 | `_bookkeeping_sync` | `:4544` | 상태 동기화 + CPU 복사 |
 | `finalize_kv_connector` | `:4561` | 지연 finalize (spec) |
 | `ModelRunnerOutput` 조립 | `:4571` | 업링크 (`kv_connector_output` 포함) |
-| `_get_kv_connector_output` | `kv_connector_model_runner_mixin.py:78` | connector lifecycle 컨테이너 |
+| `_get_kv_connector_output` | `kv_connector_model_runner_mixin.py:78` | V1 connector lifecycle 컨테이너 |
 | `maybe_transfer_kv_layer` | `kv_transfer_utils.py:15` | per-layer load/save 데코레이터 |
+| `KVConnector`/`ActiveKVConnector` | `gpu/kv_connector.py:29,47` | **V2** connector 래퍼 (pre/post/no_forward) |
+| `use_v2_model_runner` | `config/vllm.py:519` | V1/V2 선택 로직 |
+| V1/V2 runner 분기 | `gpu_worker.py:327~341` | 미지원 케이스는 V1 폴백 |
 
 ## 6. 한 줄 요약
 
