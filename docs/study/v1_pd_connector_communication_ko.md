@@ -99,33 +99,110 @@ sequenceDiagram
 > worker가 여러 개(TP/PP)면 각자 `KVConnectorWorkerMetadata`를 내고
 > `aggregate()`(base.py:161)로 합쳐 scheduler-side에 전달됩니다.
 
-## 4. Worker-side forward lifecycle (KV load/save)
+## 4. Connector 사이클 — scheduler ↔ worker 상호작용
 
-한 번의 forward를 감싸는 4개 hook. **launch(비동기 시작)** 과 **barrier(완료 대기)** 가 번갈아 나옵니다.
+!!! info "컴포넌트 내부 상세는 각 컴포넌트 문서로"
+    scheduler-side가 `schedule()`/`update_from_output()` 안에서 동작하는 법은
+    [Scheduler 흐름 §6](v1_scheduler_schedule_flow_ko.md), worker-side가
+    `execute_model`/`sample_tokens` 안에서 동작하는 법(컨테이너·두 변형·오케스트레이션)은
+    [Worker 흐름 §4](v1_worker_execute_model_flow_ko.md)에 정리돼 있습니다.
+    이 절은 **그 둘이 한 step에서 맞물리는 통합 사이클**에 집중합니다.
+
+### worker-side hook 요약 (통합 흐름 이해용)
+
+worker-side connector는 `execute_model`의 forward를 감싸는 contextmanager
+`_get_kv_connector_output`(`kv_connector_model_runner_mixin.py:78`) 안에서 **enter
+(bind+start_load) → forward(per-layer) → exit(wait_for_save+수확)** 한 단위로 돕니다.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant FC as forward context
     participant W as worker-side connector
     participant Attn as attention layers
     participant Buf as paged KV buffer
 
-    FC->>W: start_load_kv() — base.py:292 (launch: remote KV → buffer 비동기 LOAD)
+    Note over W: (enter) start_load_kv — base.py:292 (remote KV → buffer 비동기 LOAD)
     loop layer마다 (maybe_transfer_kv_layer 데코레이터)
         Attn->>W: wait_for_layer_load(layer) — base.py:310 (barrier)
         W-->>Attn: 이 layer KV 준비 완료
         Attn->>Attn: attention 계산
-        Attn->>W: save_kv_layer(layer, kv, meta) — base.py:324 (launch: buffer → 외부 비동기 SAVE)
+        Attn->>W: save_kv_layer(layer) — base.py:324 (비동기 SAVE)
     end
-    FC->>W: wait_for_save() — base.py:346 (barrier: 모든 save 완료까지 block)
-    Note over Buf: wait_for_save 이후에야 buffer 재사용 안전<br/>(진행 중 save가 끝나기 전 overwrite 방지)
+    Note over W: (exit) wait_for_save — base.py:346 (모든 save 완료까지 block)
+    Note over Buf: wait_for_save 이후에야 buffer 재사용 안전
 ```
 
-- `start_load_kv` / `save_kv_layer`: 복사를 **시작만** 하고 리턴 → model 실행과 KV 전송 overlap.
-- `wait_for_layer_load` / `wait_for_save`: 그 async 작업의 **완료 배리어**.
-- `wait_for_save`의 스코프 = **forward 1회 내부**. 같은 forward 종료 후 다음 step이
-  paged buffer를 덮어쓰기 전에 진행 중인 save를 마치게 함.
+- `start_load_kv`/`save_kv_layer` = launch(비동기 시작), `wait_for_layer_load`/`wait_for_save`
+  = barrier(완료 대기).
+- 두 변형(`no_forward` = forward 없는 KV step, `defer_finalize` = spec decode에서 finalize
+  지연)과 execute_model 오케스트레이션 상세는 **[Worker 흐름 §4](v1_worker_execute_model_flow_ko.md)** 참고.
+
+### 통합 lifecycle — scheduler ↔ worker 한 바퀴 ★
+
+엔진 1 step에서 **scheduler-side(계획·사후처리)** 와 **worker-side(실행)** 가 어떻게
+유기적으로 맞물리는지 — 다운링크 메타로 내려가 실행되고, 업링크 output으로 되돌아옵니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sc as Scheduler
+    participant CnS as connector (scheduler-side)
+    participant W as worker (execute_model / _get_kv_connector_output)
+    participant CnW as connector (worker-side)
+    participant Attn as attention layers
+
+    Note over Sc,CnS: ① schedule() — 계획 (forward 전)
+    Sc->>CnS: get_num_new_matched_tokens — :618 (external KV hit)
+    Sc->>CnS: update_state_after_alloc — :788 (할당블록 ↔ remote 연결)
+    Sc->>CnS: build_connector_meta — :955
+    CnS-->>Sc: KVConnectorMetadata
+    Sc->>W: SchedulerOutput (+ kv_connector_metadata) [다운링크]
+
+    Note over W,CnW: ② _get_kv_connector_output enter
+    W->>CnW: bind_connector_metadata — mixin:89
+    W->>CnW: start_load_kv — mixin:95 (비동기 LOAD 시작)
+    Note over W,Attn: ③ forward 본문 (per-layer)
+    loop layer마다
+        Attn->>CnW: wait_for_layer_load / save_kv_layer
+    end
+    Note over W,CnW: ④ _get_kv_connector_output exit(finally)
+    W->>CnW: wait_for_save — mixin:100
+    W->>CnW: get_finished / get_block_ids_with_load_errors — mixin:103,105
+    W->>CnW: clear_connector_metadata — mixin:112
+    CnW-->>W: KVConnectorOutput (finished_sending/recving, invalid_block_ids)
+    W-->>Sc: ModelRunnerOutput (+ KVConnectorOutput) [업링크]
+
+    Note over Sc,CnS: ⑤ update_from_output — 사후 반영 (forward 후)
+    Sc->>CnS: update_connector_output(...) (worker 결과 반영)
+    Sc->>Sc: invalid_block_ids → _handle_invalid_blocks — :1358 (실패 → recompute)
+    Sc->>CnS: request_finished — :2126 (종료 시 block free 지연 + kv_transfer_params)
+    CnS-->>Sc: (delay_free_blocks, kv_transfer_params)
+```
+
+| 단계 | 주체 | 무엇 | 다운/업 |
+| --- | --- | --- | --- |
+| ① schedule() | scheduler-side | external hit 산출·할당연결·**메타 생성** | — |
+| → SchedulerOutput | — | `kv_connector_metadata` 운반 | **다운링크** |
+| ② enter | worker-side | `bind` + `start_load_kv` | — |
+| ③ forward | worker-side | per-layer `wait_for_layer_load`/`save_kv_layer` | — |
+| ④ exit | worker-side | `wait_for_save` + `get_finished`/`invalid` 수확 | — |
+| → ModelRunnerOutput | — | `KVConnectorOutput` 운반 | **업링크** |
+| ⑤ update_from_output | scheduler-side | `update_connector_output` / `_handle_invalid_blocks` / `request_finished` | — |
+
+> 한 바퀴 요약: **scheduler가 계획을 메타로 내려보내면(①→다운링크), worker 컨테이너가
+> 그 메타를 bind해 load→forward→save→수확으로 실행하고(②③④), 결과를 output으로
+> 올려보내(→업링크) scheduler가 완료·실패·종료를 반영(⑤)** 한다. scheduler-side와
+> worker-side는 같은 connector의 두 역할이고, 둘을 잇는 와이어는 `SchedulerOutput`
+> (메타)·`ModelRunnerOutput`(output) 두 객체뿐이다 (§3 참고).
+
+### worker 오케스트레이션 — 요약 (상세는 worker 문서)
+
+> 컨테이너를 **언제·어느 변형으로** 부르고, spec decode일 때 `defer_finalize`로
+> target+draft 두 forward의 save를 한 번에 flush하는 오케스트레이션은 worker의
+> **`execute_model`(forward) → `sample_tokens`(sampling)** 2단계에 걸쳐 있습니다
+> (`self.kv_connector_output`이 두 메서드를 잇고, `finalize_kv_connector`는
+> `sample_tokens`에서 draft forward 뒤에 호출). 3겹(오케스트레이션/컨테이너/per-layer)
+> 구조와 defer 흐름은 [Worker 흐름 §3·§4](v1_worker_execute_model_flow_ko.md) 참고.
 
 ## 5. 요청 종료 시 — 비동기 block free 핸드셰이크
 

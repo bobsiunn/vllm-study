@@ -386,5 +386,6 @@ num_new_tokens = request.num_tokens - num_computed_tokens       # :684 (local/ex
 > 요청은 skip, 외부 KV hit은 connector로 조회한 뒤, 모든 결정을 `SchedulerOutput`(+
 > connector 메타데이터)으로 묶어 worker에 넘긴다.
 
-관련 노트: [Connector 통신 구조](v1_pd_connector_communication_ko.md),
+관련 노트: [Worker `execute_model` 흐름](v1_worker_execute_model_flow_ko.md),
+[Connector 통신 구조](v1_pd_connector_communication_ko.md),
 [P/D Disaggregation 가이드](v1_pd_disaggregation_lmcache_study_guide_ko.md).
