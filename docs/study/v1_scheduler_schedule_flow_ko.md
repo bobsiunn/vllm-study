@@ -328,6 +328,98 @@ sequenceDiagram
 > 처리(output/cleanup)** 세 군데에 흩어져 scheduler의 정상 흐름에 흡수돼 있습니다.
 > 전용 connector 루프는 없습니다.
 
+### 각 hook의 call-site 코드 분석
+
+#### schedule() 안 (forward 전)
+
+**① `get_num_new_matched_tokens` — Phase 2 admission (:616~636)**
+```python
+if self.connector is not None:
+    ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+        request, num_new_local_computed_tokens)            # :618 local 다음부터 external 매칭
+    if ext_tokens is None:                                 # connector가 토큰 수 결정 못함
+        request_queue.pop_request()
+        step_skipped_waiting.prepend_request(request)       # 이번 step 보류
+        continue
+    num_external_computed_tokens = ext_tokens
+    connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
+    connector_prefix_cache_hits = num_external_computed_tokens          # 통계용
+```
+반환 `load_kv_async`가 True면 "remote KV를 받아야 함" → 이후 `num_new_tokens=0`으로
+가는 분기를 켭니다(§4c).
+
+**② `update_state_after_alloc` — 할당 직후 (:787~801)**
+```python
+new_blocks = self.kv_cache_manager.allocate_slots(request, num_new_tokens,
+    new_computed_blocks=new_computed_blocks,               # local 블록
+    num_external_computed_tokens=num_external_computed_tokens,  # external 개수
+    delay_cache_blocks=load_kv_async, ...)
+if self.connector is not None:
+    self.connector.update_state_after_alloc(               # :788 할당 블록 ↔ remote KV 연결
+        request, self.kv_cache_manager.get_blocks(request_id),
+        num_external_computed_tokens)
+    if self.connector_prefix_cache_stats is not None and connector_prefix_cache_queries != 0:
+        self.connector_prefix_cache_stats.record(...)       # 통계 기록
+```
+이후 `load_kv_async`면 `request.status = WAITING_FOR_REMOTE_KVS`로 보내고 skip(:804~824).
+
+**③ `build_connector_meta` — Phase 3 assemble (:954~956)**
+```python
+if self.connector is not None:
+    meta = self._build_kv_connector_meta(self.connector, scheduler_output)  # :955
+    scheduler_output.kv_connector_metadata = meta          # 다운링크 부착
+# :969  _build_kv_connector_meta(connector, so) = connector.build_connector_meta(so)
+```
+
+#### update_from_output() 안 (forward 후)
+
+**④ `invalid_block_ids` → `_handle_invalid_blocks` (:1357~1365)**
+```python
+failed_kv_load_req_ids = None
+if kv_connector_output and kv_connector_output.invalid_block_ids:   # external load 실패 블록
+    failed_kv_load_req_ids = self._handle_invalid_blocks(          # :1362
+        kv_connector_output.invalid_block_ids, num_scheduled_tokens)
+    # → 영향받은 요청의 num_computed_tokens를 롤백 → 다음 step에 recompute
+```
+
+**⑤ `update_connector_output` + finished 처리 (:1597 호출 → `_update_from_kv_xfer_finished` :2221)**
+```python
+# update_from_output 안:
+if kv_connector_output:
+    self._update_from_kv_xfer_finished(kv_connector_output)         # :1597
+
+def _update_from_kv_xfer_finished(self, kv_connector_output):       # :2221
+    if self.connector is not None:
+        self.connector.update_connector_output(kv_connector_output) # :2233 worker 결과 반영
+    for req_id in kv_connector_output.finished_recving or ():       # recv 완료
+        if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            self.finished_recving_kv_req_ids.add(req_id)            # 다음 step 스케줄 가능해짐
+        else:
+            self._free_blocks(self.requests[req_id])
+    for req_id in kv_connector_output.finished_sending or ():       # send 완료
+        ...  # producer 블록 free (request_finished로 pin해둔 것 해제)
+```
+이게 §5(요청 종료 핸드셰이크)의 `get_finished` 결과가 scheduler로 반영되는 지점입니다.
+
+**⑥ `request_finished` → `_connector_finished` (:1894 호출 → :2099)**
+```python
+def _free_request(self, request, delay_free_blocks=False):          # :1888
+    connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)  # :1894
+    ...
+    delay_free_blocks |= connector_delay_free_blocks
+    if not delay_free_blocks:
+        self._free_blocks(request)        # delay면 free 미룸 = block pin
+    return kv_xfer_params                 # → 요청 output(outputs.py)으로
+
+def _connector_finished(self, request):                             # :2099
+    if self.connector is None: return False, None
+    self.kv_cache_manager.remove_skipped_blocks(...)   # out-of-window prefix 먼저 정리
+    block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+    if not isinstance(self.connector, SupportsHMA):
+        return self.connector.request_finished(request, block_ids[0])      # :2126
+    return self.connector.request_finished_all_groups(request, block_ids)  # HMA 다중 그룹
+```
+
 ### local prefix hit vs external KV hit — 합류와 분리
 
 connector가 가장 깊이 개입하는 지점이 **external KV hit**입니다. 이게 local prefix

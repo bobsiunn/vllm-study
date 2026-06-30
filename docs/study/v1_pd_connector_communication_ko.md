@@ -40,6 +40,29 @@ flowchart TB
 > `kv_role`이 그 역할을 표현합니다. `scheduler connector`/`worker connector`도
 > 별개 클래스가 아니라 **같은 connector를 두 `KVConnectorRole`로 띄운 것**입니다.
 
+**코드 분석** — 두 축은 별개 enum/Literal로 정의됩니다:
+
+```python
+# 축 B: base.py:124 — 프로세스 역할
+class KVConnectorRole(enum.Enum):
+    SCHEDULER = 0    # scheduler 프로세스에서 도는 connector
+    WORKER = 1       # worker 프로세스에서 도는 connector
+
+# 축 A: config/kv_transfer.py:11~13, 114~119 — 배포 역할
+KVProducer = Literal["kv_producer", "kv_both"]
+KVConsumer = Literal["kv_consumer", "kv_both"]
+@property
+def is_kv_producer(self) -> bool:
+    return self.kv_connector is not None and self.kv_role in get_args(KVProducer)
+@property
+def is_kv_consumer(self) -> bool:
+    return self.kv_connector is not None and self.kv_role in get_args(KVConsumer)
+```
+
+`kv_both`가 **두 Literal 모두에 포함**된다는 게 포인트 — 한 instance가 producer이자
+consumer일 수 있습니다(단일 instance KV offload/sharing). 두 축은 곱집합으로 조합됩니다
+(예: producer instance(`kv_role`)의 SCHEDULER-side connector(`KVConnectorRole`)).
+
 ## 2. 큰 그림 — 통신은 두 종류
 
 ```mermaid
@@ -98,6 +121,32 @@ sequenceDiagram
 
 > worker가 여러 개(TP/PP)면 각자 `KVConnectorWorkerMetadata`를 내고
 > `aggregate()`(base.py:161)로 합쳐 scheduler-side에 전달됩니다.
+
+**코드 분석** — 두 객체가 엔진 배관(`SchedulerOutput`/`ModelRunnerOutput`)에 실립니다:
+
+```python
+# ↓ 다운링크: scheduler가 메타를 SchedulerOutput에 부착 (scheduler.py:954~956)
+if self.connector is not None:
+    meta = self._build_kv_connector_meta(self.connector, scheduler_output)
+    scheduler_output.kv_connector_metadata = meta
+# 그 필드 정의 (v1/core/sched/output.py:233)
+kv_connector_metadata: KVConnectorMetadata | None = None
+
+# worker가 받아서 설치/소비 (kv_connector_model_runner_mixin.py)
+kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)  # :89 설치
+# ... forward hook들이 _get_connector_metadata()로 읽음 (base.py:231) ...
+output.finished_sending, output.finished_recving = \
+    kv_connector.get_finished(scheduler_output.finished_req_ids)              # :103 업링크 채움
+
+# ↑ 업링크: scheduler가 ModelRunnerOutput에서 읽어 connector에 반영 (scheduler.py)
+kv_connector_output = model_runner_output.kv_connector_output                 # :1340
+self._update_from_kv_xfer_finished(kv_connector_output)                       # :1597
+#   └ self.connector.update_connector_output(kv_connector_output)            # :2233
+```
+
+→ 두 반쪽은 **직접 함수 호출이 전혀 없습니다.** `kv_connector_metadata`(↓)와
+`KVConnectorOutput`(↑) 두 직렬화 객체만 주고받습니다. 그래서 worker가 별도 프로세스든
+(TP/PP로) 여러 개든 동일하게 동작합니다.
 
 ## 4. Connector 사이클 — scheduler ↔ worker 상호작용
 
@@ -246,6 +295,39 @@ sequenceDiagram
 - 실패 경로: 일부 block load 실패는 `get_block_ids_with_load_errors()`(base.py:375)로
   보고 → scheduler가 `invalid_block_ids`로 처리(scheduler.py:1358).
 
+**코드 분석** — `_free_request`가 connector에게 묻고 free를 지연합니다:
+
+```python
+# scheduler.py:1888~1905  _free_request
+def _free_request(self, request, delay_free_blocks=False):
+    connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)  # :1894
+    ...
+    delay_free_blocks |= connector_delay_free_blocks
+    if not delay_free_blocks:
+        self._free_blocks(request)        # ★ delay면 호출 안 함 = block pin
+    return kv_xfer_params                 # → 요청 output(outputs.py)으로
+
+# scheduler.py:2099~2128  _connector_finished
+def _connector_finished(self, request):
+    if self.connector is None:
+        return False, None
+    self.kv_cache_manager.remove_skipped_blocks(...)   # out-of-window prefix 먼저 정리
+    block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+    if not isinstance(self.connector, SupportsHMA):
+        return self.connector.request_finished(request, block_ids[0])      # :2126
+    return self.connector.request_finished_all_groups(request, block_ids)  # HMA 다중 그룹
+```
+
+그리고 free 해제는 §3 업링크의 `get_finished` 결과가 도착했을 때 일어납니다:
+
+```python
+# scheduler.py:2221~  _update_from_kv_xfer_finished (update_from_output 경로)
+for req_id in kv_connector_output.finished_sending or ():   # 전송 완료 통지
+    ...  # request_finished로 pin해둔 producer 블록을 이제 free
+```
+
+→ `request_finished`(pin) ↔ `get_finished`(unpin)이 **여러 step에 걸친 한 쌍**입니다.
+
 ## 6. 축 2 — instance 사이 P/D 흐름 (실제 proxy 기준)
 
 아래는 `examples/disaggregated/disaggregated_serving/disagg_proxy_multiturn.py`의
@@ -288,6 +370,33 @@ sequenceDiagram
   `do_remote_decode=True` ⇒ 그 노드는 **Prefill 노드**(`is_p_node`),
   `do_remote_prefill=True` ⇒ 그 노드는 **Decode 노드**(`is_d_node`, remote KV fetch).
 
+**코드 분석** — proxy 3단계 (`disagg_proxy_multiturn.py`):
+
+```python
+# Step 2: P 요청 — prefill만 강제 (py:184~201, _send_to_prefill)
+payload["stream"] = False
+payload["max_tokens"] = 1                           # ★ 1토큰만 = decode 안 함
+resp = await client.client.post(endpoint, json=payload, ...)
+return resp.json()                                  # P의 kv_transfer_params 포함
+
+# P 응답 → D 요청에 갈아끼움 (_handle_request py:421~425)
+p_kv_params = prefill_resp.get("kv_transfer_params", {})
+if p_kv_params:
+    p_kv_params["remote_host"] = prefill_client.host  # ★ proxy가 host 주입
+    req_data["kv_transfer_params"] = p_kv_params
+
+# Step 3: D 요청 — 스트리밍 + 마지막 chunk에서 params 캡처 (py:255~260)
+kv_params = chunk.get("kv_transfer_params")
+if kv_params:
+    kv_params["remote_host"] = client.host
+    captured_kv = kv_params
+    if conversation_id:
+        kv_cache.put(conversation_id, kv_params)    # 다음 turn용 캐시
+```
+
+→ proxy는 KV tensor를 절대 만지지 않고, **P의 block 정보를 D 요청 body로 옮기고
+`remote_host`만 채워줍니다.** 실제 PULL은 D worker가 `start_load_kv`로 직접(축 2b).
+
 ### 제어 평면 vs 데이터 평면 — serving은 metadata만 운반
 
 serving layer가 나르는 건 **오직 `kv_transfer_params: dict[str, Any]` 하나**입니다.
@@ -316,6 +425,26 @@ flowchart LR
 > connector transport**를 탑니다. serving은 데이터 평면을 전혀 모른 채 metadata
 > 봉투만 pass-through합니다 — 이 분리가 P/D 아키텍처의 근간입니다.
 
+**코드 분석** — 모든 경계에서 `dict[str, Any]`로 보존:
+
+```python
+# 들어올 때 (serve/disagg/protocol.py:112)
+class GenerateRequest(BaseModel):
+    kv_transfer_params: dict[str, Any] | None = Field(default=None, ...)
+
+# 엔진 출력 carrier + 스트리밍 병합 시 "최신 chunk 값 유지" (outputs.py:143,149)
+self.kv_transfer_params = kv_transfer_params               # :143
+def add(self, next_output, aggregate):
+    self.kv_transfer_params = next_output.kv_transfer_params  # :149 ★ 덮어씀
+
+# 나갈 때 (serve/disagg/serving.py:325)
+response = GenerateResponse(..., kv_transfer_params=final_res.kv_transfer_params)
+```
+
+serving 코드 어디에도 `kv_transfer_params`의 **내부 키를 해석하는 로직이 없습니다** —
+그냥 dict를 통째로 운반만 합니다. `add()`가 최신값으로 덮는 게 proxy의 "마지막 chunk
+캡처"(§6 코드)와 정확히 맞물립니다.
+
 ## 7. Multi-turn bidirectional KV transfer
 
 multiturn proxy의 진짜 포인트는 **이전 turn의 KV가 D에 남아 있다는 것**입니다.
@@ -332,6 +461,34 @@ multiturn proxy의 진짜 포인트는 **이전 turn의 KV가 D에 남아 있다
   죽은 remote block을 참조하는 일을 방지. (이게 PD 가이드 Failure 체크리스트의
   "lease/TTL 만료" 항목의 실제 구현입니다.)
 - `conversation_id`가 없으면 cross-turn 재사용 비활성화 → 매 turn 재계산(py:372).
+
+**코드 분석** — 단일사용(pop) + TTL 캐시, 그리고 HIT 시 P에 D 블록 주입:
+
+```python
+# ConversationKVCache.get — pop이라 한 번 쓰면 사라짐 (py:96~119)
+def get(self, conversation_id):
+    entry = self._store.pop(conversation_id, None)        # ★ pop = 단일 사용
+    if entry is None: return None
+    if time.time() - entry.timestamp > self._ttl:         # TTL 초과면 폐기
+        return None
+    return dict(entry.kv_transfer_params)
+
+# 전역 인스턴스: TTL은 NIXL abort보다 작게 (py:153~155)
+kv_cache = ConversationKVCache(ttl_seconds=450.0)  # < VLLM_NIXL_ABORT_REQUEST_TIMEOUT (480s)
+
+# Step 1: HIT면 D 블록 정보를 P 요청에 부착 (_handle_request py:383~404)
+cached_kv = kv_cache.get(conversation_id) if conversation_id else None
+if cached_kv:
+    cached_kv["do_remote_decode"] = True
+    cached_kv["do_remote_prefill"] = False                # P는 prefill 노드
+    req_data["kv_transfer_params"] = cached_kv            # ★ D의 remote_block_ids 그대로 → P가 읽음
+else:
+    req_data["kv_transfer_params"] = {"do_remote_decode": True, "remote_block_ids": None, ...}
+```
+
+→ HIT/MISS를 가르는 건 `do_remote_prefill`(둘 다 False)이 아니라 **`remote_block_ids`가
+채워졌는지**입니다. HIT면 그 안에 이전 turn D 블록 정보가 있어 P가 **역방향(D→P)** 으로
+읽습니다(§7 bidirectional).
 
 ### 전체 흐름 (Step 0 ~ 끝, `_handle_request` 기준)
 
@@ -468,6 +625,40 @@ sequenceDiagram
 > 핸드셰이크가 실패 경로에서 재사용되는 모습이고, §7의 lease/TTL(proxy 450s < abort
 > 480s)은 이 통지가 유실됐을 때의 안전망이다.
 
+**코드 분석** — 감지(serving)와 합성 요청(AsyncLLM):
+
+```python
+# serving.py:413~445  _with_kv_transfer_rejection_cleanup
+kv_transfer_params = self.has_kv_connector and request.kv_transfer_params
+if not kv_transfer_params or not kv_transfer_params.get("do_remote_prefill"):
+    return await awaitable                          # D측 remote-prefill 요청만 대상
+notify = True
+try:
+    result = await awaitable
+    if not isinstance(result, ErrorResponse):
+        notify = False                              # 정상 진입 → 통지 불필요
+    return result
+finally:
+    if notify:                                      # 예외/ErrorResponse = admission 전 reject
+        await self.engine_client.notify_kv_transfer_request_rejected(...)  # :435
+
+# async_llm.py:723~748  합성 pre-aborted 요청
+request = EngineCoreRequest(
+    request_id=request_id, prompt_token_ids=[0],    # 더미 1토큰
+    sampling_params=SamplingParams(max_tokens=1,
+        extra_args={"kv_transfer_params": dict(kv_transfer_params)}),
+    abort_immediately=True)                         # ★ add 직후 abort 유도
+await self.engine_core.add_request_async(request)
+
+# core.py:372~376  abort_immediately → request_finished 유도
+self.scheduler.add_request(request)
+if request.abort_immediately:
+    self.abort_requests([request.request_id])       # → finish_requests → request_finished
+```
+
+→ 진짜 요청이 아니라 **거부된 req_id를 단 가짜 요청을 add+abort**해서, scheduler의 정상
+종료 경로(`request_finished`)가 P 블록 cleanup을 대신 처리하게 만듭니다.
+
 ## 9. Connector를 켜면 바뀌는 것 (제한·자동조정)
 
 `--kv-transfer-config`로 connector가 켜지면 `VllmConfig` post-init에서 다른 기능이
@@ -496,6 +687,35 @@ sequenceDiagram
 > **꺼지고**, (4) `expandable_segments`·routed-experts·일부 chunked-prefill 조합은
 > **아예 거부**됩니다. 핵심 동인은 connector가 KV 메모리를 pin/register하고
 > layer 단위 async 전송을 한다는 점입니다.
+
+**코드 분석** — 자동 주입(예)과 거부(예) 한 개씩:
+
+```python
+# 자동조정: offload size 설정 시 connector를 자동 지정 (config/vllm.py:774~802)
+if (kv_offloading_size := self.cache_config.kv_offloading_size) is None:
+    return
+if self.kv_transfer_config is None:
+    self.kv_transfer_config = KVTransferConfig()
+if kv_offloading_backend == "native":
+    config_connector = "SimpleCPUOffloadConnector" if envs.VLLM_USE_SIMPLE_KV_OFFLOAD \
+        else "OffloadingConnector"
+    self.kv_transfer_config.kv_connector = config_connector
+...
+self.kv_transfer_config.kv_role = "kv_both"          # ★ 사용자가 안 줬어도 자동 설정
+
+# 제한: expandable_segments 비호환 거부 (config/vllm.py:804~845)
+def _verify_kv_transfer_compat(self):
+    if self.kv_transfer_config is None or self.kv_transfer_config.kv_connector is None:
+        return
+    if "expandable_segments:True" not in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return                                       # 안 켜져 있으면 통과
+    if self.model_config is not None and self.model_config.enable_cumem_allocator:
+        return                                       # cumem이면 예외 허용
+    raise ValueError("KV connector ... incompatible with expandable_segments:True ...")
+```
+
+→ connector가 KV 메모리를 **pin/register**(NIXL의 `ibv_reg_mr` 등)하는데, CUDA VMM이
+가상주소를 remap하면 그 등록이 stale해져 RDMA가 깨지므로 **fail-fast로 거부**합니다.
 
 ## 10. Code Map (v0.23.0)
 
