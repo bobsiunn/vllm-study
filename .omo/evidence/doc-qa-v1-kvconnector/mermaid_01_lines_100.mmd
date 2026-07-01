@@ -1,0 +1,15 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+flowchart LR
+    classDef control fill:#DBEAFE,stroke:#2563EB,color:#111827,stroke-width:1.5px
+    classDef data fill:#DCFCE7,stroke:#16A34A,color:#111827,stroke-width:1.5px
+    classDef sched fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
+    classDef worker fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
+
+    S["Scheduler<br/>token accounting"]:::sched
+    M["metadata<br/>KVConnectorMetadata / kv_transfer_params"]:::control
+    W["Worker<br/>attention forward"]:::worker
+    K["KV bytes<br/>paged KV buffer / transport"]:::data
+
+    S -->|"계획: 어떤 KV를 쓸지"| M
+    M -->|"전달: opaque instruction"| W
+    W -->|"실행: load/save"| K

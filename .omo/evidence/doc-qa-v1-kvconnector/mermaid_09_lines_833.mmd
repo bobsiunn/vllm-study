@@ -1,0 +1,23 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+flowchart TB
+    classDef concept fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-width:1.5px
+    classDef scheduler fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
+    classDef worker fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
+    classDef proxy fill:#EDE9FE,stroke:#7C3AED,color:#111827,stroke-width:1.5px
+    classDef data fill:#DCFCE7,stroke:#16A34A,color:#111827,stroke-width:1.5px
+    classDef fail fill:#FEE2E2,stroke:#DC2626,color:#111827,stroke-width:1.5px
+
+    A["local + external<br/>computed-token accounting"]:::scheduler
+    B["KVConnectorMetadata<br/>SchedulerOutput downlink"]:::scheduler
+    C["worker context<br/>bind/start/load/save/get_finished"]:::worker
+    D["kv_transfer_params<br/>HTTP/proxy control plane"]:::proxy
+    E["KV bytes<br/>connector transport data plane"]:::data
+    F["cleanup<br/>invalid blocks / delayed free / lease"]:::fail
+
+    A --> B
+    B --> C
+    D --> A
+    D --> E
+    C --> E
+    C --> F
+    F --> A

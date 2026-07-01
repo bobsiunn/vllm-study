@@ -1,0 +1,21 @@
+Invocation: source existence loop for all explicit source/study refs in target document
+OK docs/study/v1_pd_connector_communication_ko.md
+OK docs/study/v1_pd_disaggregation_lmcache_study_guide_ko.md
+OK docs/study/v1_scheduler_schedule_flow_ko.md
+OK docs/study/v1_worker_execute_model_flow_ko.md
+OK docs/study/v1_kv_cache_lmcache_study_guide_ko.md
+OK docs/features/nixl_connector_usage.md
+OK docs/design/nixl_kv_cache_lease.md
+OK docs/features/disagg_prefill.md
+OK vllm/config/kv_transfer.py
+OK vllm/distributed/kv_transfer/kv_connector/v1/base.py
+OK vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py
+OK vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py
+OK vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
+OK vllm/v1/core/sched/scheduler.py
+OK vllm/v1/core/sched/output.py
+OK vllm/v1/worker/kv_connector_model_runner_mixin.py
+OK vllm/model_executor/layers/attention/kv_transfer_utils.py
+OK vllm/entrypoints/serve/disagg/protocol.py
+OK vllm/outputs.py
+OK examples/disaggregated/disaggregated_serving/disagg_proxy_multiturn.py

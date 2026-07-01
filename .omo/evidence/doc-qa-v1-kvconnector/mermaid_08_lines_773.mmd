@@ -1,0 +1,19 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+sequenceDiagram
+    autonumber
+    participant Sv as Serving
+    participant AL as AsyncLLM
+    participant EC as EngineCore
+    participant Sc as Scheduler
+    participant Cn as Connector
+    participant P as Prefill-side blocks
+
+    rect rgb(254, 226, 226)
+    Sv->>Sv: request rejected before engine admission
+    Sv->>AL: notify_kv_transfer_request_rejected
+    AL->>EC: add synthetic request<br/>abort_immediately=True
+    EC->>Sc: add_request
+    EC->>Sc: abort_requests
+    Sc->>Cn: request_finished
+    Cn->>P: notify/free pinned remote-prefill blocks
+    end

@@ -1,0 +1,27 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+sequenceDiagram
+    autonumber
+    participant Sc as Scheduler
+    participant Cs as Scheduler-side Connector
+    participant W as Worker ModelRunner
+    participant Cw as Worker-side Connector
+    participant A as Attention Layer
+
+    rect rgb(255, 247, 237)
+    Sc->>Cs: get_num_new_matched_tokens
+    Sc->>Cs: update_state_after_alloc
+    Sc->>Cs: build_connector_meta
+    end
+    Sc-->>W: SchedulerOutput + KVConnectorMetadata
+    rect rgb(252, 231, 243)
+    W->>Cw: bind_connector_metadata
+    W->>Cw: start_load_kv
+    A->>Cw: wait_for_layer_load
+    A->>Cw: save_kv_layer
+    W->>Cw: wait_for_save / get_finished
+    end
+    W-->>Sc: ModelRunnerOutput + KVConnectorOutput
+    rect rgb(239, 246, 255)
+    Sc->>Cs: update_connector_output
+    Sc->>Cs: request_finished
+    end

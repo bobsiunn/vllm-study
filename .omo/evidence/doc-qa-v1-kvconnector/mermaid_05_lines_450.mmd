@@ -1,0 +1,34 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+sequenceDiagram
+    autonumber
+    participant S as Scheduler
+    participant SC as Scheduler-side Connector
+    participant SO as SchedulerOutput
+    participant W as Worker ModelRunner
+    participant WC as Worker-side Connector
+    participant A as Attention
+    participant MO as ModelRunnerOutput
+
+    rect rgb(255, 247, 237)
+    S->>SC: get_num_new_matched_tokens
+    S->>SC: update_state_after_alloc
+    S->>SC: build_connector_meta
+    SC-->>SO: KVConnectorMetadata
+    end
+    SO-->>W: downlink metadata
+    rect rgb(252, 231, 243)
+    W->>WC: bind_connector_metadata
+    W->>WC: start_load_kv
+    loop each attention layer
+        A->>WC: wait_for_layer_load
+        A->>A: attention compute
+        A->>WC: save_kv_layer
+    end
+    W->>WC: wait_for_save / get_finished / invalid blocks
+    WC-->>MO: KVConnectorOutput
+    end
+    MO-->>S: uplink output
+    rect rgb(239, 246, 255)
+    S->>SC: update_connector_output
+    S->>S: invalid_block_ids handling
+    end

@@ -1,0 +1,238 @@
+Invocation: nl -ba docs/study/v1_kvconnector_disaggregation_analysis_ko.md | sed -n ...
+Target stats:
+     889 docs/study/v1_kvconnector_disaggregation_analysis_ko.md
+
+Headings and fences:
+1:# V1 KVConnector와 P/D Disaggregation 분석
+16:## 읽는 법
+27:## 1. KVConnector란 무엇인가
+29:### 핵심 명제
+41:### local prefix cache와 external KV hit
+52:### computed token 회계
+57:```python
+58:# vllm/v1/core/sched/scheduler.py:610~641 (요약)
+69:```
+98:### 제어 평면과 데이터 평면
+100:```mermaid
+116:```
+124:## 2. 두 가지 role 축
+126:### 축 A: `kv_role`
+135:```python
+136:# vllm/config/kv_transfer.py:11~13, 109~119 (요약)
+145:```
+147:### 축 B: `KVConnectorRole`
+155:```python
+156:# vllm/distributed/kv_transfer/kv_connector/v1/base.py:124~129
+160:```
+162:### 두 축을 섞으면 안 되는 이유
+164:```mermaid
+187:```
+195:## 3. `KVConnectorBase_V1` API 지도
+197:### scheduler-side API
+207:### worker-side API
+218:### API lifecycle 요약
+220:```mermaid
+248:```
+250:## 4. `ExampleConnector`로 최소 구현 읽기
+252:### 왜 ExampleConnector를 먼저 보나
+265:### 최소 구현의 흐름
+277:```python
+278:# vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:251~286 (요약)
+285:```
+293:```python
+294:# example_connector.py:300~374 (요약)
+304:```
+312:### production connector에서 커지는 부분
+328:## 5. KVConnector 통신의 두 종류
+330:### 한 장 요약
+332:```mermaid
+360:```
+369:## 6. Intra instance 통신
+371:### 핵심 명제
+379:### downlink: scheduler가 metadata를 붙인다
+381:```python
+382:# vllm/v1/core/sched/scheduler.py:950~956 (요약)
+386:```
+388:```python
+389:# vllm/v1/core/sched/output.py:233
+391:```
+405:### worker lifecycle: forward를 감싸는 context
+407:```python
+408:# vllm/v1/worker/kv_connector_model_runner_mixin.py:78~112 (요약)
+420:```
+429:### per-layer hook: attention 앞뒤에서 load/save
+431:```python
+432:# vllm/model_executor/layers/attention/kv_transfer_utils.py:37~58 (요약)
+440:```
+448:### 전체 intra-instance sequence
+450:```mermaid
+485:```
+493:### request 종료와 delayed free
+495:```python
+496:# vllm/v1/core/sched/scheduler.py:1888~1905 (요약)
+502:```
+504:```python
+505:# vllm/v1/core/sched/scheduler.py:2221~2248 (요약)
+508:```
+524:## 7. Inter instance 통신: P/D disaggregation
+526:### 핵심 명제
+533:### `kv_transfer_params`가 지나가는 schema
+535:```python
+536:# vllm/entrypoints/serve/disagg/protocol.py:112~115
+541:```
+543:```python
+544:# vllm/outputs.py:123~149 (요약)
+550:```
+564:### single-turn P -> D
+566:```mermaid
+593:```
+606:### proxy 코드에서 보이는 metadata relay
+608:```python
+609:# examples/.../disagg_proxy_multiturn.py:188~201
+615:```
+617:```python
+618:# examples/.../disagg_proxy_multiturn.py:421~425
+623:```
+631:### `kv_transfer_params` field inventory
+648:### multi-turn bidirectional D -> P -> D
+650:```mermaid
+678:```
+693:## 8. Failure와 cleanup
+695:### 왜 실패 경로가 핵심인가
+705:### invalid block
+707:```python
+708:# vllm/v1/core/sched/scheduler.py:1357~1365 (요약)
+714:```
+728:### admission 전 reject cleanup
+734:```python
+735:# vllm/entrypoints/openai/engine/serving.py:422~435 (요약)
+743:```
+745:```python
+746:# vllm/v1/engine/async_llm.py:733~747 (요약)
+756:```
+758:```python
+759:# vllm/v1/engine/core.py:372~376
+763:```
+771:### reject cleanup sequence
+773:```mermaid
+793:```
+795:### lease와 TTL
+808:### cleanup checklist
+819:## 9. 최종 mental model
+821:### 세 문장 요약
+831:### 한 장짜리 map
+833:```mermaid
+857:```
+865:## 출처 모음
+
+Relevant issue lines:
+   162	### 두 축을 섞으면 안 되는 이유
+   163	
+   164	```mermaid
+   165	%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+   166	flowchart TB
+   167	    classDef instance fill:#E0F2FE,stroke:#0284C7,color:#111827,stroke-width:1.5px
+   168	    classDef proc fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
+   169	    classDef note fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-dasharray:4 3
+   170	
+   171	    subgraph A["축 A: instance 배포 역할 (`kv_role`)"]
+   172	        P["kv_producer<br/>prefill instance"]:::instance
+   173	        D["kv_consumer<br/>decode instance"]:::instance
+   174	        B["kv_both"]:::instance
+   175	    end
+   176	
+   177	    subgraph R["축 B: connector process 역할 (`KVConnectorRole`)"]
+   178	        S["SCHEDULER<br/>scheduler-side connector"]:::proc
+   179	        W["WORKER<br/>worker-side connector"]:::proc
+   180	    end
+   181	
+   182	    P -. "한 prefill instance 안에도" .-> S
+   183	    P -. "scheduler-side와 worker-side가 모두 존재" .-> W
+   184	    D -. "decode instance도 동일" .-> S
+   185	    D -. "두 role connector를 띄움" .-> W
+   186	    N["`prefill/decode instance`는 코드 심볼이 아니라<br/>`kv_role`과 request metadata로 표현됨"]:::note
+   187	```
+   188	
+   631	### `kv_transfer_params` field inventory
+   632	
+   633	| field | 만드는 쪽 | 읽는 쪽 | 의미 |
+   634	| --- | --- | --- | --- |
+   635	| `do_remote_decode` | proxy / connector output | connector | 이 요청이 P 역할 흐름인지 표현 |
+   636	| `do_remote_prefill` | proxy / connector output | connector | 이 요청이 D 역할로 remote KV를 읽는지 표현 |
+   637	| `remote_block_ids` | producer connector `request_finished` | consumer worker connector | 읽을 remote block IDs |
+   638	| `remote_engine_id` | producer connector | consumer connector | 어느 engine의 block인지 |
+   639	| `remote_request_id` | producer connector | proxy / consumer connector | remote request identity |
+   640	| `remote_host` | proxy | consumer connector | 어느 host에서 읽을지 |
+   641	| `remote_port` | producer/config | consumer connector | side-channel/transport port |
+   642	
+   643	관련 노트:
+   644	
+   645	- `docs/study/v1_pd_connector_communication_ko.md`
+   646	- `docs/features/nixl_connector_usage.md`
+   647	
+   650	```mermaid
+   651	%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+   652	sequenceDiagram
+   653	    autonumber
+   654	    participant C as Client
+   655	    participant X as Stateful Proxy
+   656	    participant Cache as ConversationKVCache
+   657	    participant P as Prefill Instance
+   658	    participant D as Decode Instance
+   659	
+   660	    rect rgb(237, 233, 254)
+   661	    C->>X: next turn + conversation_id
+   662	    X->>Cache: get(conversation_id)
+   663	    Cache-->>X: previous D kv_transfer_params
+   664	    end
+   665	    rect rgb(224, 242, 254)
+   666	    X->>P: request + D remote_block_ids
+   667	    P->>D: pull previous-turn KV from D
+   668	    P->>P: prefill only new tokens
+   669	    P-->>X: P kv_transfer_params
+   670	    end
+   671	    rect rgb(220, 252, 231)
+   672	    X->>D: request + P kv_transfer_params
+   673	    D->>P: pull new KV from P
+   674	    D-->>X: streamed response + D kv_transfer_params
+   675	    X->>Cache: put(conversation_id, D params)
+   676	    X-->>C: response
+   677	    end
+   678	```
+   821	### 세 문장 요약
+   822	
+   823	- **얼마나 계산할지**는 scheduler token accounting이 결정합니다.
+   824	    - 새 request에서는 local prefix hit과 external KV hit이 computed token으로 합쳐집니다.
+   825	- **KV를 어떻게 확보할지**는 connector lifecycle이 결정합니다.
+   826	    - local reuse, async remote load, layer-wise save, invalid block recovery는 다른 경로입니다.
+   827	- **instance 사이에서 무엇이 이동하는지**는 control plane/data plane 분리로 봅니다.
+   828	    - `kv_transfer_params`는 proxy/HTTP로 이동하는 metadata.
+   829	    - 실제 KV bytes는 worker-side connector transport로 이동.
+   830	
+   831	### 한 장짜리 map
+   832	
+   833	```mermaid
+   834	%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+   835	flowchart TB
+   836	    classDef concept fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-width:1.5px
+   837	    classDef scheduler fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
+   838	    classDef worker fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
+   839	    classDef proxy fill:#EDE9FE,stroke:#7C3AED,color:#111827,stroke-width:1.5px
+   840	    classDef data fill:#DCFCE7,stroke:#16A34A,color:#111827,stroke-width:1.5px
+   841	    classDef fail fill:#FEE2E2,stroke:#DC2626,color:#111827,stroke-width:1.5px
+   842	
+   843	    A["local + external<br/>computed-token accounting"]:::scheduler
+   844	    B["KVConnectorMetadata<br/>SchedulerOutput downlink"]:::scheduler
+   845	    C["worker context<br/>bind/start/load/save/get_finished"]:::worker
+   846	    D["kv_transfer_params<br/>HTTP/proxy control plane"]:::proxy
+   847	    E["KV bytes<br/>connector transport data plane"]:::data
+   848	    F["cleanup<br/>invalid blocks / delayed free / lease"]:::fail
+   849	
+   850	    A --> B
+   851	    B --> C
+   852	    D --> A
+   853	    D --> E
+   854	    C --> E
+   855	    C --> F
+   856	    F --> A
+   857	```

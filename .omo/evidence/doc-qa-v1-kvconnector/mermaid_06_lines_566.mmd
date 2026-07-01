@@ -1,0 +1,26 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant X as Proxy
+    participant P as Prefill Instance
+    participant D as Decode Instance
+    participant PW as P Worker
+    participant DW as D Worker
+
+    rect rgb(237, 233, 254)
+    C->>X: original request
+    X->>P: stream=false, max_tokens=1, do_remote_decode=true
+    end
+    rect rgb(255, 247, 237)
+    P->>P: prefill prompt KV
+    P-->>X: response + kv_transfer_params
+    X->>X: inject remote_host
+    X->>D: request + P kv_transfer_params
+    end
+    rect rgb(220, 252, 231)
+    DW->>PW: pull KV bytes via connector transport
+    D->>D: decode/generate
+    D-->>X: streamed output + final kv_transfer_params
+    X-->>C: response
+    end

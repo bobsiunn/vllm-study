@@ -1,0 +1,22 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+flowchart TB
+    classDef instance fill:#E0F2FE,stroke:#0284C7,color:#111827,stroke-width:1.5px
+    classDef proc fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
+    classDef note fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-dasharray:4 3
+
+    subgraph A["축 A: instance 배포 역할 (`kv_role`)"]
+        P["kv_producer<br/>prefill instance"]:::instance
+        D["kv_consumer<br/>decode instance"]:::instance
+        B["kv_both"]:::instance
+    end
+
+    subgraph R["축 B: connector process 역할 (`KVConnectorRole`)"]
+        S["SCHEDULER<br/>scheduler-side connector"]:::proc
+        W["WORKER<br/>worker-side connector"]:::proc
+    end
+
+    P -. "한 prefill instance 안에도" .-> S
+    P -. "scheduler-side와 worker-side가 모두 존재" .-> W
+    D -. "decode instance도 동일" .-> S
+    D -. "두 role connector를 띄움" .-> W
+    N["`prefill/decode instance`는 코드 심볼이 아니라<br/>`kv_role`과 request metadata로 표현됨"]:::note

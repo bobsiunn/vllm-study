@@ -1,0 +1,27 @@
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant X as Stateful Proxy
+    participant Cache as ConversationKVCache
+    participant P as Prefill Instance
+    participant D as Decode Instance
+
+    rect rgb(237, 233, 254)
+    C->>X: next turn + conversation_id
+    X->>Cache: get(conversation_id)
+    Cache-->>X: previous D kv_transfer_params
+    end
+    rect rgb(224, 242, 254)
+    X->>P: request + D remote_block_ids
+    P->>D: pull previous-turn KV from D
+    P->>P: prefill only new tokens
+    P-->>X: P kv_transfer_params
+    end
+    rect rgb(220, 252, 231)
+    X->>D: request + P kv_transfer_params
+    D->>P: pull new KV from P
+    D-->>X: streamed response + D kv_transfer_params
+    X->>Cache: put(conversation_id, D params)
+    X-->>C: response
+    end
