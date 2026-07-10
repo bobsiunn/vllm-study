@@ -98,7 +98,6 @@ num_computed_tokens = (
 ### 제어 평면과 데이터 평면
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 flowchart LR
     classDef control fill:#DBEAFE,stroke:#2563EB,color:#111827,stroke-width:1.5px
     classDef data fill:#DCFCE7,stroke:#16A34A,color:#111827,stroke-width:1.5px
@@ -169,30 +168,28 @@ class KVConnectorRole(enum.Enum):
 
 ### 두 축을 섞으면 안 되는 이유
 
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
+<div class="mermaid">
 flowchart TB
     classDef instance fill:#E0F2FE,stroke:#0284C7,color:#111827,stroke-width:1.5px
     classDef proc fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
-    classDef note fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-dasharray:4 3
+    classDef note fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-width:1.5px
 
-    subgraph A["축 A: instance 배포 역할 kv_role"]
-        P["kv_producer<br/>prefill instance"]:::instance
-        D["kv_consumer<br/>decode instance"]:::instance
-        B["kv_both"]:::instance
-    end
-
-    subgraph R["축 B: connector process 역할 KVConnectorRole"]
-        S["SCHEDULER<br/>scheduler-side connector"]:::proc
-        W["WORKER<br/>worker-side connector"]:::proc
-    end
-
-    P -. "한 prefill instance 안에도" .-> S
-    P -. "scheduler-side와 worker-side가 모두 존재" .-> W
-    D -. "decode instance도 동일" .-> S
-    D -. "두 role connector를 띄움" .-> W
+    P["kv_producer<br/>prefill instance"]:::instance
+    D["kv_consumer<br/>decode instance"]:::instance
+    B["kv_both<br/>producer + consumer"]:::instance
+    S["SCHEDULER<br/>scheduler-side connector"]:::proc
+    W["WORKER<br/>worker-side connector"]:::proc
     N["prefill/decode instance는 코드 심볼이 아니라<br/>kv_role과 request metadata로 표현됨"]:::note
-```
+
+    P -.-> S
+    P -.-> W
+    D -.-> S
+    D -.-> W
+    B -.-> S
+    B -.-> W
+    P --> N
+    D --> N
+</div>
 
 읽는 포인트:
 
@@ -234,7 +231,6 @@ flowchart TB
 ### API lifecycle 요약
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 sequenceDiagram
     autonumber
     participant Sc as Scheduler
@@ -262,6 +258,32 @@ sequenceDiagram
     Sc->>Cs: request_finished
     end
 ```
+
+이 플로우는 한 scheduler step 안에서 connector가 끼어드는 위치를 보여줍니다.
+
+1. **Scheduler-side planning**
+    - `get_num_new_matched_tokens()`가 local prefix cache 밖의 external KV hit을
+      계산합니다.
+    - scheduler가 block을 할당한 뒤 `update_state_after_alloc()`으로 "어느 local
+      block에 external KV를 채울지"를 connector state에 반영합니다.
+    - `build_connector_meta()`가 worker가 실행할 load/save 지시를
+      `KVConnectorMetadata`로 만듭니다.
+
+2. **Worker-side execution**
+    - worker model runner는 `SchedulerOutput.kv_connector_metadata`를
+      `bind_connector_metadata()`로 worker connector에 설치합니다.
+    - `start_load_kv()`가 forward 전에 load 작업을 준비하거나 시작합니다.
+    - attention layer는 계산 직전에 `wait_for_layer_load()`로 필요한 KV가 준비됐는지
+      기다리고, 계산 뒤 `save_kv_layer()`로 새 KV 저장을 시작할 수 있습니다.
+    - forward context가 끝나면 `wait_for_save()`와 `get_finished()`가 완료된
+      save/load request id를 수확합니다.
+
+3. **Feedback and cleanup**
+    - worker는 `ModelRunnerOutput.kv_connector_output`으로 완료, 실패, worker-side
+      metadata를 scheduler에 올립니다.
+    - scheduler-side connector는 `update_connector_output()`으로 uplink를 반영합니다.
+    - request가 끝날 때 `request_finished()`가 block을 즉시 free할지, connector가
+      async 작업을 끝낼 때까지 delayed free할지 결정합니다.
 
 !!! note "LMCache에서는?"
     LMCacheConnectorV1 wrapper는 공통 V1 API를 그대로 구현하지만 대부분의 실제
@@ -295,6 +317,100 @@ sequenceDiagram
 | external hit | storage에 prompt hash folder가 있으면 block-aligned token 수 반환 | `example_connector.py:251~286` |
 | allocation 이후 상태 | external token이 있으면 `_requests_need_load`에 request 기록 | `example_connector.py:288~298` |
 | metadata build | scheduled request를 load/store metadata로 변환하고 내부 상태 clear | `example_connector.py:300~374` |
+
+#### metadata 정의
+
+```python
+# example_connector.py:31~81 (요약)
+@dataclass
+class ReqMeta:
+    token_ids: torch.Tensor
+    slot_mapping: torch.Tensor
+    is_store: bool
+    mm_hashes: list[str]
+
+    @staticmethod
+    def make_meta(token_ids, block_ids, block_size, is_store, mm_hashes):
+        valid_num_tokens = align_to_block_size(len(token_ids), block_size)
+        token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
+        block_ids_tensor = torch.tensor(block_ids)
+        block_offsets = torch.arange(0, block_size)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_tensor.reshape((-1, 1)) * block_size
+        ).flatten()[:valid_num_tokens]
+        return ReqMeta(token_ids_tensor, slot_mapping, is_store, mm_hashes)
+
+@dataclass
+class ExampleConnectorMetadata(KVConnectorMetadata):
+    requests: list[ReqMeta] = field(default_factory=list)
+```
+
+읽는 포인트:
+
+- `ReqMeta`는 worker가 load/store를 실행하는 데 필요한 최소 단위입니다.
+- `token_ids`는 KV file key를 만들 때 쓰이고, `slot_mapping`은 vLLM paged KV buffer의
+  어느 slot에 읽거나 쓸지 나타냅니다.
+- `is_store=True`면 현재 forward 결과를 저장하고, `False`면 외부 KV를 local paged
+  buffer로 load합니다.
+- `ExampleConnectorMetadata.requests`는 한 scheduler step에서 worker가 처리할
+  request 목록입니다.
+
+#### load: 외부 KV를 paged buffer에 주입
+
+```python
+# example_connector.py:151~183 (요약)
+metadata = self._get_connector_metadata()
+attn_metadata = forward_context.attn_metadata
+for request in metadata.requests:
+    if request.is_store:
+        continue
+    for layer_name, layer in forward_context.no_compile_layers.items():
+        kv_cache_layer = getattr(layer, "kv_cache", None)
+        if kv_cache_layer is None:
+            continue
+        filename = self._generate_filename_debug(
+            layer_name, request.token_ids, request.mm_hashes
+        )
+        kv_cache = safetensors.torch.load_file(filename, device=...)["kv_cache"]
+        inject_kv_into_layer(kv_cache_layer, kv_cache, request.slot_mapping, ...)
+```
+
+읽는 포인트:
+
+- load는 `start_load_kv()`에서 시작됩니다.
+- metadata 중 `is_store=False`인 request만 처리합니다.
+- debug storage에서 layer별 safetensors 파일을 읽고, `slot_mapping` 위치에 KV를
+  직접 주입합니다.
+- attention layer가 아닌 layer는 `kv_cache` attribute가 없으므로 건너뜁니다.
+
+#### save: paged buffer에서 KV를 뽑아 저장
+
+```python
+# example_connector.py:221~246 (요약)
+def extract_kv_from_layer(layer, slot_mapping):
+    block_idxs = slot_mapping // self._block_size
+    offsets = slot_mapping % self._block_size
+    return layer[block_idxs, :, offsets]
+
+metadata = self._get_connector_metadata()
+for request in metadata.requests:
+    if request.is_store:
+        filename = self._generate_filename_debug(
+            layer_name, request.token_ids, request.mm_hashes
+        )
+        kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
+        safetensors.torch.save_file({"kv_cache": kv_cache.detach().cpu()}, filename)
+```
+
+읽는 포인트:
+
+- save는 attention layer wrapper가 `save_kv_layer()`를 호출할 때 실행됩니다.
+- `slot_mapping`을 block index와 block offset으로 나누어 paged KV buffer에서 필요한
+  token 위치만 뽑습니다.
+- 저장 key는 load와 같은 방식으로 `layer_name + token_ids + mm_hashes`에서 만들어집니다.
+- 이 symmetry 때문에 다음 request가 같은 prefix를 만나면 `get_num_new_matched_tokens()`
+  에서 external hit으로 인정할 수 있습니다.
 
 ```python
 # vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:251~286 (요약)
@@ -358,7 +474,6 @@ def build_connector_meta(self, scheduler_output):
 ### 한 장 요약
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 flowchart LR
     classDef scheduler fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
     classDef worker fill:#FCE7F3,stroke:#DB2777,color:#111827,stroke-width:1.5px
@@ -391,10 +506,37 @@ flowchart LR
 
 이 그림에서 봐야 할 것:
 
-- **intra instance**: 한 vLLM instance 내부의 scheduler-side ↔ worker-side.
-- **inter instance**: prefill instance ↔ decode instance.
-- inter control plane은 proxy/HTTP의 `kv_transfer_params`.
-- inter data plane은 worker-side connector transport입니다.
+- **intra instance 통신**
+    - 한 vLLM instance 안에서 scheduler-side connector와 worker-side connector가
+      정보를 주고받는 경로입니다.
+    - scheduler-side connector가 `build_connector_meta()`로
+      `KVConnectorMetadata`를 만들면, 이 metadata가 `SchedulerOutput`에 실려
+      worker로 내려갑니다.
+    - worker-side connector는 forward 전후와 attention layer hook에서 load/save를
+      수행하고, 결과를 `KVConnectorOutput`에 담아 `ModelRunnerOutput`으로 올립니다.
+    - 이 통신은 Python object metadata 중심입니다. scheduler가 KV tensor를 직접
+      옮기지는 않습니다.
+
+- **inter instance 통신**
+    - prefill instance와 decode instance 사이의 통신입니다.
+    - 이 통신은 다시 control plane과 data plane으로 나누어 봐야 합니다.
+    - **control plane**:
+        - request-level metadata가 이동하는 경로입니다.
+        - 일부 connector/serving flow에서는 proxy가 request/response body의
+          `kv_transfer_params`를 이어 붙입니다.
+        - 이 metadata는 "어느 요청이 어떤 remote KV를 참조하는가" 같은 제어 정보를
+          담을 수 있지만, 그 자체가 KV tensor는 아닙니다.
+        - connector마다 control plane의 중요도가 다릅니다. LMCache P/D 예제처럼
+          proxy가 `kv_transfer_params`를 relay하지 않고도 같은 backend를 통해 KV를
+          공유하는 흐름도 있습니다.
+    - **data plane**:
+        - 실제 KV bytes가 이동하거나 공유되는 경로입니다.
+        - worker-side connector 또는 connector backend가 담당합니다.
+        - 따라서 data plane은 connector 구현에 강하게 의존합니다.
+            - LMCacheConnectorV1: prefiller가 LMCache backend에 저장하고 decoder가
+              같은 key space에서 lookup/retrieve합니다.
+            - 직접 전송형 connector: worker 간 전송 transport를 통해 KV bytes가 이동할 수
+              있습니다.
 
 !!! note "LMCache에서는?"
     LMCache P/D 예제의 inter-instance 공유 지점은 proxy가 옮기는 remote block
@@ -492,7 +634,6 @@ def wrapper(*args, **kwargs):
 ### 전체 intra-instance sequence
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 sequenceDiagram
     autonumber
     participant S as Scheduler
@@ -588,7 +729,6 @@ for req_id in kv_connector_output.finished_sending or ():
 ### LMCache P/D example의 proxy 흐름
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 sequenceDiagram
     autonumber
     participant C as Client
@@ -717,7 +857,6 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
 ### LMCache worker-side load/save
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 flowchart TB
     classDef sched fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
     classDef meta fill:#DBEAFE,stroke:#2563EB,color:#111827,stroke-width:1.5px
@@ -888,7 +1027,6 @@ def request_finished(request, block_ids):
 ### 한 장짜리 map
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#ffffff", "fontFamily": "Inter, Arial"}} }%%
 flowchart TB
     classDef concept fill:#F8FAFC,stroke:#64748B,color:#111827,stroke-width:1.5px
     classDef scheduler fill:#FEF3C7,stroke:#D97706,color:#111827,stroke-width:1.5px
